@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import ttk
 
 import database as db_module
+from database import STEP_DONE, StepDependencyError
+from templates import ACTION_CHECKLIST, ACTION_EDO_SIGN, ACTION_GUARD_SIGN
 
 CHECK_INTERVAL_SECONDS = 1
 UI_QUEUE_POLL_MS = 200
@@ -134,6 +136,10 @@ class NotificationManager:
 
     def _tick(self):
         changed = self.db.mark_overdue() > 0
+        if self.db.activate_due_deferred_branches() > 0:
+            changed = True
+        if self.db.ensure_waiting_step_reminders() > 0:
+            changed = True
 
         due = self.db.get_due_reminders()
         current_keys = {(item["id"], item["due_time"]) for item in due}
@@ -224,6 +230,10 @@ class NotificationManager:
 
     def _show_popup(self, reminder):
         """Окно напоминания поверх всех окон. Только из главного потока."""
+        step = None
+        if reminder.get("id") and reminder.get("step_id"):
+            step = self.db.get_step(reminder["step_id"])
+
         popup = tk.Toplevel(self.root)
         popup.title("Напоминание")
         popup.configure(padx=20, pady=16)
@@ -234,7 +244,7 @@ class NotificationManager:
             popup,
             text=reminder["title"],
             font=("Segoe UI", 14, "bold"),
-            wraplength=380,
+            wraplength=420,
             justify="left",
         ).pack(anchor="w")
 
@@ -251,7 +261,7 @@ class NotificationManager:
                 popup,
                 text=description,
                 font=("Segoe UI", 10),
-                wraplength=380,
+                wraplength=420,
                 justify="left",
             ).pack(anchor="w", pady=(0, 12))
 
@@ -264,34 +274,150 @@ class NotificationManager:
             if popup.winfo_exists():
                 popup.destroy()
 
+        def postpone_wait():
+            if step:
+                self.db.postpone_step_escalation(step["id"])
+            self._notify_change()
+            close_popup()
+
+        def complete_step(note=""):
+            try:
+                self.db.update_step_status(step["id"], STEP_DONE, result_note=note)
+            except StepDependencyError as error:
+                from tkinter import messagebox
+
+                messagebox.showwarning("Шаг заблокирован", str(error), parent=popup)
+                return
+            self._notify_change()
+            close_popup()
+
         def mark_done():
-            self.db.update_status(reminder["id"], db_module.STATUS_DONE)
+            if step and step.get("action_kind") == ACTION_CHECKLIST:
+                close_popup()
+                self._show_checklist(step["id"])
+                return
+            if reminder.get("id"):
+                self.db.update_status(reminder["id"], db_module.STATUS_DONE)
             self._notify_change()
             close_popup()
 
         def snooze():
-            self.db.snooze_reminder(reminder["id"], SNOOZE_MINUTES)
+            if reminder.get("id"):
+                self.db.snooze_reminder(reminder["id"], SNOOZE_MINUTES)
             self._notify_change()
             close_popup()
 
-        # У тестового уведомления нет записи в базе, менять её статус нечем.
-        if reminder["id"]:
+        action = (step or {}).get("action_kind") or ""
+        if step and action == ACTION_EDO_SIGN:
+            ttk.Button(
+                buttons,
+                text="Договор подписан контрагентом",
+                command=lambda: complete_step("Подписан контрагентом"),
+            ).pack(side="left", padx=(0, 6))
+            ttk.Button(
+                buttons, text="Ещё нет, договор в ожидании", command=postpone_wait
+            ).pack(side="left", padx=(0, 6))
+            popup.protocol("WM_DELETE_WINDOW", postpone_wait)
+        elif step and action == ACTION_GUARD_SIGN:
+            if self.db.guard_threshold_reached(step["id"]):
+                ttk.Button(
+                    buttons,
+                    text="Подписать самостоятельно",
+                    command=lambda: complete_step("Подписано самостоятельно"),
+                ).pack(side="left", padx=(0, 6))
+                ttk.Button(
+                    buttons,
+                    text="Продолжать ждать",
+                    command=lambda: complete_step("Продолжаем ждать подпись"),
+                ).pack(side="left", padx=(0, 6))
+                popup.protocol("WM_DELETE_WINDOW", postpone_wait)
+            else:
+                ttk.Button(
+                    buttons, text="Ещё ждём подпись заказчика", command=postpone_wait
+                ).pack(side="left", padx=(0, 6))
+                ttk.Button(buttons, text="Закрыть", command=postpone_wait).pack(side="left")
+                popup.protocol("WM_DELETE_WINDOW", postpone_wait)
+        elif reminder.get("id"):
             ttk.Button(buttons, text="Готово", command=mark_done).pack(
                 side="left", padx=(0, 6)
             )
             ttk.Button(
                 buttons, text=f"Отложить на {SNOOZE_MINUTES} мин", command=snooze
             ).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
+            ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
+            popup.protocol("WM_DELETE_WINDOW", close_popup)
+        else:
+            ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
+            popup.protocol("WM_DELETE_WINDOW", close_popup)
 
-        popup.protocol("WM_DELETE_WINDOW", close_popup)
-
-        # Автозакрытия нет намеренно: окно должно дождаться реакции пользователя.
         self._open_popups.append(popup)
         self._place_popup(popup)
 
         popup.lift()
         popup.focus_force()
+
+    def _show_checklist(self, step_id):
+        """Модальное окно блокирующего чек-листа."""
+        from tkinter import messagebox
+
+        items = self.db.get_checklist_items(step_id)
+        step = self.db.get_step(step_id)
+        if step is None:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Чек-лист шага")
+        dialog.configure(padx=20, pady=16)
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+
+        ttk.Label(
+            dialog,
+            text=step["title"],
+            font=("Segoe UI", 12, "bold"),
+            wraplength=420,
+        ).pack(anchor="w", pady=(0, 10))
+        ttk.Label(
+            dialog,
+            text="Шаг закроется только когда отмечены все пункты.",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(0, 8))
+
+        vars_by_id = {}
+        for item in items:
+            var = tk.BooleanVar(value=bool(item["is_checked"]))
+            vars_by_id[item["id"]] = var
+            ttk.Checkbutton(dialog, text=item["text"], variable=var).pack(
+                anchor="w", pady=2
+            )
+
+        def save_and_maybe_close():
+            try:
+                for item_id, var in vars_by_id.items():
+                    self.db.check_checklist_item(step_id, item_id, var.get())
+            except StepDependencyError as error:
+                messagebox.showwarning("Шаг заблокирован", str(error), parent=dialog)
+                return
+            remaining = [
+                item
+                for item in self.db.get_checklist_items(step_id)
+                if not item["is_checked"]
+            ]
+            self._notify_change()
+            if remaining:
+                messagebox.showinfo(
+                    "Чек-лист неполный",
+                    "Отмечены не все пункты — шаг остаётся открытым.",
+                    parent=dialog,
+                )
+                return
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Сохранить", command=save_and_maybe_close).pack(
+            anchor="e", pady=(12, 0)
+        )
+        self._place_popup(dialog)
+        dialog.focus_force()
 
     def _notify_change(self):
         if self.on_change:
@@ -338,6 +464,10 @@ class NotificationManager:
                 "due_time": db_module.now_str(),
             },
         )
+
+    def show_checklist(self, step_id):
+        """Открыть чек-лист из вкладки процессов."""
+        self._show_checklist(step_id)
 
     def test_notification(self):
         """Проверка доставки уведомлений из интерфейса."""
