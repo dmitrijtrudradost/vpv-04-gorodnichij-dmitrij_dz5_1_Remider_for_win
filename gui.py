@@ -29,6 +29,7 @@ from templates import (
     TEMPLATE_GUARD,
     TEMPLATE_LABELS,
 )
+import autostart
 
 APP_VERSION = "2.0"
 
@@ -683,6 +684,11 @@ class ReminderApp:
             pystray.MenuItem("Открыть", self._tray_show, default=True),
             pystray.MenuItem("Тест уведомления", self._tray_test),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Запускать при входе в Windows", self._tray_enable_autostart
+            ),
+            pystray.MenuItem("Не запускать при входе", self._tray_disable_autostart),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", self._tray_exit),
         )
 
@@ -702,6 +708,29 @@ class ReminderApp:
 
     def _tray_test(self, *_args):
         self.notifier.test_notification()
+
+    def _tray_enable_autostart(self, *_args):
+        self.root.after(0, self._enable_autostart)
+
+    def _tray_disable_autostart(self, *_args):
+        self.root.after(0, self._disable_autostart)
+
+    def _enable_autostart(self):
+        try:
+            path = autostart.enable()
+            messagebox.showinfo(
+                "Автозапуск",
+                f"Ярлык создан:\n{path}\n\nПрограмма будет стартовать при входе в Windows.",
+            )
+        except Exception as error:
+            messagebox.showerror("Автозапуск", str(error))
+
+    def _disable_autostart(self):
+        try:
+            autostart.disable()
+            messagebox.showinfo("Автозапуск", "Ярлык из папки «Автозагрузка» удалён.")
+        except Exception as error:
+            messagebox.showerror("Автозапуск", str(error))
 
     def _tray_exit(self, *_args):
         self.root.after(0, self.quit_app)
