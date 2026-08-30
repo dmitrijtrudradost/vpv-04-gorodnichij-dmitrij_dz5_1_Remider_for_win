@@ -39,6 +39,38 @@ except Exception:
     TRAY_AVAILABLE = False
 
 
+class PersistentDateEntry(DateEntry):
+    """DateEntry, у которого стрелки месяца и года не закрывают выпадающее окно.
+
+    В tkcalendar клик по шапке календаря вызывает FocusOut, и штатный
+    ``_on_focus_out_cal`` прячет Toplevel, пока кнопка ещё не сменила месяц.
+    """
+
+    def _pointer_over_calendar(self):
+        if not self._top_cal.winfo_ismapped():
+            return False
+        x, y = self._top_cal.winfo_pointerxy()
+        left = self._top_cal.winfo_rootx()
+        top = self._top_cal.winfo_rooty()
+        right = left + self._top_cal.winfo_width()
+        bottom = top + self._top_cal.winfo_height()
+        return left <= x <= right and top <= y <= bottom
+
+    def _focus_inside_calendar(self):
+        widget = self.focus_get()
+        if widget is None:
+            return False
+        calendar_path = str(self._top_cal)
+        return widget is self._calendar or str(widget).startswith(calendar_path + ".")
+
+    def _on_focus_out_cal(self, event):
+        if self._focus_inside_calendar() or self._pointer_over_calendar():
+            self._calendar.focus_force()
+            return
+        self._top_cal.withdraw()
+        self.state(["!pressed"])
+
+
 class ReminderApp:
     """Главное окно: список напоминаний, форма добавления и иконка в трее."""
 
@@ -102,7 +134,7 @@ class ReminderApp:
         time_row = ttk.Frame(form)
         time_row.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=3)
 
-        self.date_entry = DateEntry(
+        self.date_entry = PersistentDateEntry(
             time_row,
             width=12,
             locale="ru_RU",
