@@ -18,11 +18,13 @@ def configure_console():
 def main():
     configure_console()
 
+    start_in_tray = "--tray" in sys.argv
+
     db = ReminderDatabase(DB_FILENAME)
     app = None
     try:
         app = ReminderApp(db)
-        app.run()
+        app.run(start_in_tray=start_in_tray)
     finally:
         if app is not None:
             app.quit_app()

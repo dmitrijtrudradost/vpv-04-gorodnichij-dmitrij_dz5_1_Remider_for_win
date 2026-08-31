@@ -111,8 +111,8 @@ class ReminderApp:
 
     def setup_ui(self):
         self.root.title(f"Напоминалка {APP_VERSION}")
-        self.root.geometry("960x680")
-        self.root.minsize(800, 560)
+        self.root.geometry("1100x680")
+        self.root.minsize(900, 560)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         style = ttk.Style()
@@ -339,19 +339,26 @@ class ReminderApp:
         ttk.Button(
             toolbar, text="Открыть чек-лист", command=self.open_selected_checklist
         ).pack(side="left", padx=2)
+        ttk.Button(
+            toolbar,
+            text="Расписание уведомлений",
+            command=self.edit_selected_notify_schedule,
+        ).pack(side="left", padx=2)
 
         wrapper = ttk.Frame(parent)
         wrapper.pack(fill="both", expand=True)
-        columns = ("status", "detail")
+        columns = ("status", "detail", "notify")
         self.process_tree = ttk.Treeview(
             wrapper, columns=columns, show="tree headings", selectmode="browse"
         )
         self.process_tree.heading("#0", text="Процесс / ветка / шаг")
         self.process_tree.heading("status", text="Статус")
         self.process_tree.heading("detail", text="Подробности")
-        self.process_tree.column("#0", width=420)
-        self.process_tree.column("status", width=130, anchor="center")
-        self.process_tree.column("detail", width=280)
+        self.process_tree.heading("notify", text="Уведомления")
+        self.process_tree.column("#0", width=360)
+        self.process_tree.column("status", width=110, anchor="center")
+        self.process_tree.column("detail", width=200)
+        self.process_tree.column("notify", width=280)
         scroll = ttk.Scrollbar(wrapper, orient="vertical", command=self.process_tree.yview)
         self.process_tree.configure(yscrollcommand=scroll.set)
         self.process_tree.pack(side="left", fill="both", expand=True)
@@ -361,6 +368,7 @@ class ReminderApp:
         self.process_tree.tag_configure("stale", foreground="#b02020")
         self.process_tree.tag_configure("blocked", foreground="#7a7a7a")
         self.process_tree.tag_configure("deferred", foreground="#7a7a7a")
+        self.process_tree.bind("<Double-1>", self.on_process_tree_double_click)
 
     def _on_template_change(self):
         label = self.template_var.get()
@@ -411,7 +419,11 @@ class ReminderApp:
                 "end",
                 iid=process_iid,
                 text=process["title"],
-                values=(process["status"], TEMPLATE_LABELS.get(process["template_type"], "")),
+                values=(
+                    process["status"],
+                    TEMPLATE_LABELS.get(process["template_type"], ""),
+                    "",
+                ),
                 open=True,
             )
             for branch in process["branches"]:
@@ -427,7 +439,7 @@ class ReminderApp:
                     "end",
                     iid=branch_iid,
                     text=branch["title"],
-                    values=(branch["status"], extra),
+                    values=(branch["status"], extra, ""),
                     tags=(tag,) if tag else (),
                     open=not branch["is_deferred"],
                 )
@@ -448,7 +460,11 @@ class ReminderApp:
                         "end",
                         iid=f"s-{step['id']}",
                         text=step["title"],
-                        values=(step["status"], detail),
+                        values=(
+                            step["status"],
+                            detail,
+                            step.get("notify_label") or "—",
+                        ),
                         tags=(tag,) if tag else (),
                     )
 
@@ -495,6 +511,144 @@ class ReminderApp:
             return
         self.notifier.show_checklist(step_id)
         self.refresh_processes()
+
+    def on_process_tree_double_click(self, _event=None):
+        if self._selected_step_id() is None:
+            return
+        self.edit_selected_notify_schedule()
+
+    def edit_selected_notify_schedule(self):
+        step_id = self._selected_step_id()
+        if step_id is None:
+            messagebox.showinfo("Ничего не выбрано", "Выберите шаг в дереве процесса.")
+            return
+        settings = self.db.get_step_escalation(step_id)
+        if settings is None:
+            messagebox.showinfo(
+                "Нет уведомлений",
+                "У этого шага нет расписания уведомлений, править нечего.",
+            )
+            return
+        self._open_escalation_dialog(step_id, settings)
+
+    def _open_escalation_dialog(self, step_id, settings):
+        step = self.db.get_step(step_id)
+        win = tk.Toplevel(self.root)
+        win.title("Расписание уведомлений")
+        win.transient(self.root)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=step["title"] if step else "Шаг",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        first_var = tk.StringVar(value=str(settings["first_hours"]))
+        ttk.Label(frame, text="Первое через, часов:").grid(
+            row=1, column=0, sticky="w", pady=4
+        )
+        ttk.Spinbox(
+            frame,
+            from_=1,
+            to=48,
+            textvariable=first_var,
+            width=6,
+            wrap=True,
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        hour, minute = db_module.parse_hhmm(settings["repeat_time"])
+        hour_var = tk.StringVar(value=f"{hour:02d}")
+        minute_var = tk.StringVar(value=f"{minute:02d}")
+        ttk.Label(frame, text="Повтор в следующий рабочий день в:").grid(
+            row=2, column=0, sticky="w", pady=4
+        )
+        time_row = ttk.Frame(frame)
+        time_row.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Spinbox(
+            time_row, from_=9, to=23, textvariable=hour_var, width=3, wrap=True, format="%02.0f"
+        ).pack(side="left")
+        ttk.Label(time_row, text=":").pack(side="left")
+        ttk.Spinbox(
+            time_row, from_=0, to=59, textvariable=minute_var, width=3, wrap=True, format="%02.0f"
+        ).pack(side="left")
+
+        freq_var = tk.StringVar(value=str(settings["frequent_hours"]))
+        ttk.Label(frame, text="Дальше каждые, часов:").grid(
+            row=3, column=0, sticky="w", pady=4
+        )
+        ttk.Spinbox(
+            frame,
+            from_=1,
+            to=12,
+            textvariable=freq_var,
+            width=6,
+            wrap=True,
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        until_hour, until_minute = db_module.parse_notify_until(settings.get("notify_until"))
+        until_hour_var = tk.StringVar(value=f"{until_hour:02d}")
+        until_minute_var = tk.StringVar(value=f"{until_minute:02d}")
+        ttk.Label(frame, text="Уведомлять до:").grid(row=4, column=0, sticky="w", pady=4)
+        until_row = ttk.Frame(frame)
+        until_row.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Spinbox(
+            until_row,
+            from_=9,
+            to=23,
+            textvariable=until_hour_var,
+            width=3,
+            wrap=True,
+            format="%02.0f",
+        ).pack(side="left")
+        ttk.Label(until_row, text=":").pack(side="left")
+        ttk.Spinbox(
+            until_row,
+            from_=0,
+            to=59,
+            textvariable=until_minute_var,
+            width=3,
+            wrap=True,
+            format="%02.0f",
+        ).pack(side="left")
+        ttk.Label(
+            frame,
+            text="пн–пт, с 09:00 (по умолчанию до 18:00)",
+            foreground="#777777",
+        ).grid(row=4, column=2, sticky="w", padx=(8, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+
+        def save():
+            try:
+                first_hours = int(first_var.get().strip())
+                frequent_hours = int(freq_var.get().strip())
+                stamp = f"{int(hour_var.get()):02d}:{int(minute_var.get()):02d}"
+                until_stamp = (
+                    f"{int(until_hour_var.get()):02d}:{int(until_minute_var.get()):02d}"
+                )
+                self.db.update_step_escalation(
+                    step_id,
+                    first_hours * 60,
+                    stamp,
+                    frequent_hours * 60,
+                    until_stamp,
+                )
+            except ValueError as error:
+                messagebox.showerror("Не удалось сохранить", str(error), parent=win)
+                return
+            win.destroy()
+            self.refresh_processes()
+            self.refresh_reminders()
+
+        ttk.Button(buttons, text="Сохранить", command=save).pack(side="right", padx=2)
+        ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right", padx=2)
+
+        win.grab_set()
+        win.wait_window()
 
     # -------------------------------------------------------------- Actions
 
@@ -788,7 +942,10 @@ class ReminderApp:
         except tk.TclError:
             pass
 
-    def run(self):
+    def run(self, start_in_tray=False):
         self._setup_tray()
+        if start_in_tray and self._tray_icon is not None:
+            self.root.withdraw()
+            self._tray_hint_shown = True
         self.notifier.start()
         self.root.mainloop()

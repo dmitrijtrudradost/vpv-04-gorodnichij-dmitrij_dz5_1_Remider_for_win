@@ -53,7 +53,7 @@ def enable():
     script = project_root() / "main.py"
     workdir = project_root()
     link = shortcut_path()
-    arguments = f'"{script}"'
+    arguments = f'"{script}" --tray'
 
     command = "\n".join(
         [

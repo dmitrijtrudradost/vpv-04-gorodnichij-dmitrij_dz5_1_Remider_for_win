@@ -48,7 +48,11 @@ python main.py
 | Реестр `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | Строка с `"C:\...\pythonw.exe" "C:\napominalka\main.py"` | Один пользователь, ручная настройка | Правка реестра, ошибка в кавычках ломает вход |
 
 Ярлык должен вызывать **pythonw.exe**, а не python.exe: иначе при входе
-на секунду появится чёрное окно консоли.
+на секунду появится чёрное окно консоли. К `main.py` добавляется флаг `--tray`:
+окно сразу уходит в трей, а не открывается на рабочем столе.
+
+Если автозапуск уже был включён до этого обновления, выключите его и включите
+снова — иначе в ярлыке не будет `--tray`.
 
 ### Включить автозапуск (рекомендуемый способ)
 
@@ -77,14 +81,15 @@ powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Uninstall
 
 1. `Win+R` → `taskschd.msc`
 2. Создать задачу, триггер «При входе в систему»
-3. Действие: программа = полный путь к `pythonw.exe`, аргументы = полный путь к `main.py`, рабочая папка = папка проекта
+3. Действие: программа = полный путь к `pythonw.exe`, аргументы =
+   `"C:\napominalka\main.py" --tray`, рабочая папка = папка проекта
 
 Для реестра откройте `regedit`, ветка
 `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`,
 строковый параметр, значение:
 
 ```text
-"C:\Path\to\pythonw.exe" "C:\napominalka\main.py"
+"C:\Path\to\pythonw.exe" "C:\napominalka\main.py" --tray
 ```
 
 Рабочий каталог реестр не задаёт, поэтому надёжнее ярлык в Автозагрузке
