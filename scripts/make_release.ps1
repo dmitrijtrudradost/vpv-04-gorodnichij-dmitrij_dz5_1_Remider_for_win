@@ -3,7 +3,7 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $releaseDir = Join-Path $root "release"
-$zipPath = Join-Path $releaseDir "napominalka-2.0-win.zip"
+$zipPath = Join-Path $releaseDir "napominalka-2.1-win.zip"
 $stage = Join-Path $releaseDir "_stage"
 
 $files = @(

@@ -31,7 +31,7 @@ from templates import (
 )
 import autostart
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 FILTER_ALL = "Все"
 QUICK_MINUTES = (1, 5, 15, 30)
