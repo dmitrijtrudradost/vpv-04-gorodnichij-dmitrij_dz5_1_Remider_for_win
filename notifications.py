@@ -53,10 +53,11 @@ class NotificationManager:
     перезапуска, чтобы не спотыкаться о него на каждом уведомлении.
     """
 
-    def __init__(self, db, root, on_change=None):
+    def __init__(self, db, root, on_change=None, snooze_dialog=None):
         self.db = db
         self.root = root
         self.on_change = on_change
+        self._snooze_dialog = snooze_dialog
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -302,10 +303,15 @@ class NotificationManager:
             close_popup()
 
         def snooze():
-            if reminder.get("id"):
-                self.db.snooze_reminder(reminder["id"], SNOOZE_MINUTES)
-            self._notify_change()
+            rid = reminder.get("id")
             close_popup()
+            if not rid:
+                return
+            if self._snooze_dialog:
+                self._snooze_dialog(rid)
+            else:
+                self.db.snooze_reminder(rid, SNOOZE_MINUTES)
+                self._notify_change()
 
         action = (step or {}).get("action_kind") or ""
         if step and action == ACTION_EDO_SIGN:
@@ -317,6 +323,9 @@ class NotificationManager:
             ttk.Button(
                 buttons, text="Ещё нет, договор в ожидании", command=postpone_wait
             ).pack(side="left", padx=(0, 6))
+            ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                side="left", padx=(0, 6)
+            )
             popup.protocol("WM_DELETE_WINDOW", postpone_wait)
         elif step and action == ACTION_GUARD_SIGN:
             if self.db.guard_threshold_reached(step["id"]):
@@ -330,20 +339,26 @@ class NotificationManager:
                     text="Продолжать ждать",
                     command=lambda: complete_step("Продолжаем ждать подпись"),
                 ).pack(side="left", padx=(0, 6))
+                ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                    side="left", padx=(0, 6)
+                )
                 popup.protocol("WM_DELETE_WINDOW", postpone_wait)
             else:
                 ttk.Button(
                     buttons, text="Ещё ждём подпись заказчика", command=postpone_wait
                 ).pack(side="left", padx=(0, 6))
+                ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                    side="left", padx=(0, 6)
+                )
                 ttk.Button(buttons, text="Закрыть", command=postpone_wait).pack(side="left")
                 popup.protocol("WM_DELETE_WINDOW", postpone_wait)
         elif reminder.get("id"):
             ttk.Button(buttons, text="Готово", command=mark_done).pack(
                 side="left", padx=(0, 6)
             )
-            ttk.Button(
-                buttons, text=f"Отложить на {SNOOZE_MINUTES} мин", command=snooze
-            ).pack(side="left", padx=(0, 6))
+            ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                side="left", padx=(0, 6)
+            )
             ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
             popup.protocol("WM_DELETE_WINDOW", close_popup)
         else:

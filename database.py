@@ -18,6 +18,8 @@ from templates import (
     get_template,
 )
 
+USER_TEMPLATE_PREFIX = "user:"
+
 DB_FILENAME = "reminders.db"
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -52,6 +54,15 @@ class StepDependencyError(Exception):
     """Шаг нельзя закрыть: не выполнена зависимость или чек-лист."""
 
 
+def as_depends_list(value):
+    """Ключи зависимостей шага: строка, список или пусто."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
 def now_str():
     """Текущее время в том же строковом формате, в котором оно лежит в базе."""
     return datetime.now().strftime(DATETIME_FORMAT)
@@ -69,13 +80,15 @@ def parse_dt(value):
         return None
     if isinstance(value, datetime):
         return value
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, time.min)
     text = str(value).strip()
-    for fmt in (DATETIME_FORMAT, DATE_FORMAT):
+    for fmt in (DATETIME_FORMAT, DATE_FORMAT, "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y"):
         try:
             parsed = datetime.strptime(text, fmt)
-            if fmt == DATE_FORMAT:
-                return datetime.combine(parsed.date(), time.min)
-            return parsed
+            if fmt == DATETIME_FORMAT:
+                return parsed
+            return datetime.combine(parsed.date(), time.min)
         except ValueError:
             continue
     return None
@@ -257,6 +270,21 @@ class ReminderDatabase:
                     is_active     INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY (step_id) REFERENCES steps(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS process_templates (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name           TEXT NOT NULL,
+                    structure_json TEXT NOT NULL,
+                    created_at     TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS step_dependencies (
+                    step_id            INTEGER NOT NULL,
+                    depends_on_step_id INTEGER NOT NULL,
+                    PRIMARY KEY (step_id, depends_on_step_id),
+                    FOREIGN KEY (step_id) REFERENCES steps(id),
+                    FOREIGN KEY (depends_on_step_id) REFERENCES steps(id)
+                );
                 """
             )
             columns = [
@@ -273,6 +301,13 @@ class ReminderDatabase:
                 self._conn.execute(
                     "ALTER TABLE steps ADD COLUMN notify_until TEXT NOT NULL DEFAULT '18:00'"
                 )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO step_dependencies (step_id, depends_on_step_id)
+                SELECT id, depends_on_step_id FROM steps
+                WHERE depends_on_step_id IS NOT NULL
+                """
+            )
             self._conn.commit()
 
     def add_reminder(self, title, description, due_time, step_id=None):
@@ -363,11 +398,18 @@ class ReminderDatabase:
 
     def snooze_reminder(self, reminder_id, minutes):
         """Переносит напоминание на ``minutes`` минут вперёд от текущего момента."""
-        new_time = datetime.now() + timedelta(minutes=minutes)
+        return self.snooze_reminder_to(
+            reminder_id, datetime.now() + timedelta(minutes=minutes)
+        )
+
+    def snooze_reminder_to(self, reminder_id, new_due_time):
+        """Ставит абсолютное due_time, не трогая правила эскалации шага."""
+        if isinstance(new_due_time, datetime) and new_due_time <= datetime.now():
+            raise ValueError("Новое время должно быть в будущем.")
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE reminders SET due_time = ?, status = ? WHERE id = ?",
-                (to_db_format(new_time), STATUS_PENDING, reminder_id),
+                (to_db_format(new_due_time), STATUS_PENDING, reminder_id),
             )
             self._conn.commit()
             return cursor.rowcount > 0
@@ -423,103 +465,256 @@ class ReminderDatabase:
 
     # ----------------------------------------------------------- Processes
 
-    def create_process(self, template_type, title, metadata=None):
-        """Создаёт процесс по шаблону и возвращает его id."""
-        spec = get_template(template_type)
-        payload = dict(metadata or {})
-        process_title = (title or spec["default_title"]).strip()
+    def _resolve_template_spec(self, template_type):
+        if str(template_type).startswith(USER_TEMPLATE_PREFIX):
+            raw_id = str(template_type)[len(USER_TEMPLATE_PREFIX) :]
+            try:
+                template_id = int(raw_id)
+            except ValueError as error:
+                raise ValueError(f"Неизвестный шаблон: {template_type!r}") from error
+            row = self.get_process_template(template_id)
+            if row is None:
+                raise ValueError(f"Пользовательский шаблон {template_id} не найден.")
+            spec = json.loads(row["structure_json"] or "{}")
+            if not isinstance(spec, dict) or not spec.get("branches"):
+                raise ValueError("В шаблоне нет веток.")
+            spec.setdefault("default_title", row["name"])
+            return spec
+        return get_template(template_type)
 
+    def list_process_templates(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM process_templates ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_process_template(self, template_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM process_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_process_template(self, name, structure):
+        """Сохраняет пользовательский шаблон. Возвращает id."""
+        title = (name or "").strip()
+        if not title:
+            raise ValueError("Введите название шаблона.")
+        spec = structure if isinstance(structure, dict) else json.loads(structure)
+        if not spec.get("branches"):
+            raise ValueError("Добавьте хотя бы одну ветку.")
+        spec.setdefault("default_title", title)
+        payload = json.dumps(spec, ensure_ascii=False)
         with self._lock:
             cursor = self._conn.execute(
                 """
-                INSERT INTO processes (template_type, title, status, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO process_templates (name, structure_json, created_at)
+                VALUES (?, ?, ?)
                 """,
-                (template_type, process_title, PROCESS_ACTIVE, json.dumps(payload, ensure_ascii=False), now_str()),
+                (title, payload, now_str()),
             )
-            process_id = cursor.lastrowid
-            key_to_id = {}
+            self._conn.commit()
+            return cursor.lastrowid
 
-            for branch_spec in spec["branches"]:
-                deferred = bool(branch_spec.get("deferred"))
-                activation = None
-                if deferred:
-                    raw_end = payload.get(branch_spec.get("activation_field") or "end_date")
-                    end_at = parse_dt(raw_end)
-                    if end_at is None:
-                        raise ValueError("Для отложенной ветки нужна дата окончания услуг.")
-                    wake = end_at.date() - timedelta(days=GUARD_DEFER_DAYS)
-                    activation = wake.strftime(DATE_FORMAT)
-                    if wake <= date.today():
-                        deferred = False
+    def update_process_template(self, template_id, name, structure):
+        """Перезаписывает пользовательский шаблон. Запущенные процессы не трогает."""
+        title = (name or "").strip()
+        if not title:
+            raise ValueError("Введите название шаблона.")
+        spec = structure if isinstance(structure, dict) else json.loads(structure)
+        if not spec.get("branches"):
+            raise ValueError("Добавьте хотя бы одну ветку.")
+        spec.setdefault("default_title", title)
+        payload = json.dumps(spec, ensure_ascii=False)
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE process_templates
+                SET name = ?, structure_json = ?
+                WHERE id = ?
+                """,
+                (title, payload, int(template_id)),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                raise ValueError("Шаблон не найден.")
+            return int(template_id)
 
-                branch_status = BRANCH_DEFERRED if deferred else BRANCH_ACTIVE
-                branch_cursor = self._conn.execute(
+    def delete_process_template(self, template_id):
+        """Удаляет пользовательский шаблон. Запущенные процессы не трогает."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM process_templates WHERE id = ?", (int(template_id),)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def finish_process(self, process_id, result_note="Закрыт вручную"):
+        """Отмечает все шаги выполненными и переводит процесс в «завершён»."""
+        tree = self.get_process_tree(process_id)
+        if tree is None:
+            return False
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT steps.id FROM steps
+                JOIN branches ON branches.id = steps.branch_id
+                WHERE branches.process_id = ?
+                """,
+                (process_id,),
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
                     """
-                    INSERT INTO branches (process_id, title, status, is_deferred, activation_date)
+                    UPDATE steps SET status = ?, result_note = ?
+                    WHERE id = ? AND status != ?
+                    """,
+                    (STEP_DONE, result_note, row["id"], STEP_DONE),
+                )
+                self._cancel_step_reminders(row["id"])
+            self._conn.execute(
+                "UPDATE branches SET status = ? WHERE process_id = ?",
+                (BRANCH_DONE, process_id),
+            )
+            self._conn.execute(
+                "UPDATE processes SET status = ? WHERE id = ?",
+                (PROCESS_DONE, process_id),
+            )
+            self._conn.commit()
+        return True
+
+    def create_process(self, template_type, title, metadata=None):
+        """Создаёт процесс по шаблону и возвращает его id."""
+        spec = self._resolve_template_spec(template_type)
+        payload = dict(metadata or {})
+        process_title = (title or spec["default_title"]).strip()
+
+        for branch_spec in spec["branches"]:
+            if not branch_spec.get("deferred"):
+                continue
+            raw_end = payload.get(branch_spec.get("activation_field") or "end_date")
+            if parse_dt(raw_end) is None:
+                raise ValueError("Для отложенной ветки нужна дата окончания услуг.")
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO processes (template_type, title, status, metadata, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (process_id, branch_spec["title"], branch_status, int(deferred), activation),
+                    (template_type, process_title, PROCESS_ACTIVE, json.dumps(payload, ensure_ascii=False), now_str()),
                 )
-                branch_id = branch_cursor.lastrowid
+                process_id = cursor.lastrowid
+                key_to_id = {}
 
-                for index, step_spec in enumerate(branch_spec["steps"]):
-                    initial = STEP_NOT_STARTED
-                    if not deferred and index == 0:
-                        initial = STEP_WAITING
-                    elif not deferred and step_spec.get("depends_on"):
-                        initial = STEP_BLOCKED
-                    step_cursor = self._conn.execute(
+                for branch_spec in spec["branches"]:
+                    deferred = bool(branch_spec.get("deferred"))
+                    activation = None
+                    if deferred:
+                        raw_end = payload.get(branch_spec.get("activation_field") or "end_date")
+                        end_at = parse_dt(raw_end)
+                        if end_at is None:
+                            raise ValueError("Для отложенной ветки нужна дата окончания услуг.")
+                        wake = end_at.date() - timedelta(days=GUARD_DEFER_DAYS)
+                        activation = wake.strftime(DATE_FORMAT)
+                        if wake <= date.today():
+                            deferred = False
+
+                    branch_status = BRANCH_DEFERRED if deferred else BRANCH_ACTIVE
+                    branch_cursor = self._conn.execute(
                         """
-                        INSERT INTO steps (
-                            branch_id, title, order_index, status, completion_type,
-                            action_kind, depends_on_step_id, waiting_since, escalation_index
-                        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0)
+                        INSERT INTO branches (process_id, title, status, is_deferred, activation_date)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
-                        (
-                            branch_id,
-                            step_spec["title"],
-                            index,
-                            initial,
-                            step_spec["completion_type"],
-                            step_spec.get("action_kind") or "",
-                            now_str() if initial == STEP_WAITING else None,
-                        ),
+                        (process_id, branch_spec["title"], branch_status, int(deferred), activation),
                     )
-                    step_id = step_cursor.lastrowid
-                    key_to_id[step_spec["key"]] = step_id
+                    branch_id = branch_cursor.lastrowid
 
-                    for text in step_spec.get("checklist") or ():
-                        self._conn.execute(
-                            "INSERT INTO step_checklist_items (step_id, text, is_checked) VALUES (?, ?, 0)",
-                            (step_id, text),
-                        )
-                    for rule in step_spec.get("escalation") or ():
-                        self._conn.execute(
+                    for index, step_spec in enumerate(branch_spec["steps"]):
+                        deps = as_depends_list(step_spec.get("depends_on"))
+                        initial = STEP_NOT_STARTED
+                        if not deferred:
+                            initial = STEP_BLOCKED if deps else STEP_WAITING
+                        step_cursor = self._conn.execute(
                             """
-                            INSERT INTO escalation_rules
-                                (step_id, interval_type, delay_minutes, fixed_time, is_active)
-                            VALUES (?, ?, ?, ?, 1)
+                            INSERT INTO steps (
+                                branch_id, title, order_index, status, completion_type,
+                                action_kind, depends_on_step_id, waiting_since, escalation_index,
+                                notify_until
+                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?)
                             """,
                             (
-                                step_id,
-                                rule["interval_type"],
-                                int(rule.get("delay_minutes") or 0),
-                                rule.get("fixed_time") or "",
+                                branch_id,
+                                step_spec["title"],
+                                index,
+                                initial,
+                                step_spec.get("completion_type") or "ручная отметка",
+                                step_spec.get("action_kind") or "",
+                                now_str() if initial == STEP_WAITING else None,
+                                step_spec.get("notify_until") or "18:00",
                             ),
                         )
+                        step_id = step_cursor.lastrowid
+                        step_key = step_spec.get("key") or f"s{branch_id}_{index}"
+                        key_to_id[step_key] = step_id
 
-            for branch_spec in spec["branches"]:
-                for step_spec in branch_spec["steps"]:
-                    dep_key = step_spec.get("depends_on")
-                    if not dep_key:
-                        continue
-                    self._conn.execute(
-                        "UPDATE steps SET depends_on_step_id = ? WHERE id = ?",
-                        (key_to_id[dep_key], key_to_id[step_spec["key"]]),
-                    )
+                        for text in step_spec.get("checklist") or ():
+                            self._conn.execute(
+                                "INSERT INTO step_checklist_items (step_id, text, is_checked) VALUES (?, ?, 0)",
+                                (step_id, text),
+                            )
+                        for rule in step_spec.get("escalation") or ():
+                            self._conn.execute(
+                                """
+                                INSERT INTO escalation_rules
+                                    (step_id, interval_type, delay_minutes, fixed_time, is_active)
+                                VALUES (?, ?, ?, ?, 1)
+                                """,
+                                (
+                                    step_id,
+                                    rule["interval_type"],
+                                    int(rule.get("delay_minutes") or 0),
+                                    rule.get("fixed_time") or "",
+                                ),
+                            )
 
-            self._conn.commit()
+                for branch_spec in spec["branches"]:
+                    for step_spec in branch_spec["steps"]:
+                        step_key = step_spec.get("key")
+                        if step_key not in key_to_id:
+                            continue
+                        dep_ids = []
+                        seen = set()
+                        for dep_key in as_depends_list(step_spec.get("depends_on")):
+                            if dep_key not in key_to_id:
+                                continue
+                            dep_id = key_to_id[dep_key]
+                            if dep_id == key_to_id[step_key] or dep_id in seen:
+                                continue
+                            seen.add(dep_id)
+                            dep_ids.append(dep_id)
+                        step_id = key_to_id[step_key]
+                        first = dep_ids[0] if dep_ids else None
+                        self._conn.execute(
+                            "UPDATE steps SET depends_on_step_id = ? WHERE id = ?",
+                            (first, step_id),
+                        )
+                        for dep_id in dep_ids:
+                            self._conn.execute(
+                                """
+                                INSERT OR IGNORE INTO step_dependencies
+                                    (step_id, depends_on_step_id)
+                                VALUES (?, ?)
+                                """,
+                                (step_id, dep_id),
+                            )
+
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
         self._refresh_branch_step_states(process_id)
         return process_id
@@ -571,6 +766,8 @@ class ReminderDatabase:
                         step_data["escalation"],
                         step_data["notify_until"],
                     )
+                    live = self._live_reminder_for_step(step["id"])
+                    step_data["next_due"] = live["due_time"] if live else None
                     branch_data["steps"].append(step_data)
                 tree["branches"].append(branch_data)
         return tree
@@ -697,12 +894,10 @@ class ReminderDatabase:
         step = self.get_step(step_id)
         if step is None:
             return False
-        if step["depends_on_step_id"]:
-            dep = self.get_step(step["depends_on_step_id"])
-            if dep and dep["status"] != STEP_DONE:
-                raise StepDependencyError(
-                    f"Сначала завершите шаг «{dep['title']}»."
-                )
+        missing = self._unfinished_dependency_titles(step["id"])
+        if missing:
+            titles = ", ".join(f"«{title}»" for title in missing)
+            raise StepDependencyError(f"Сначала завершите {titles}.")
 
         with self._lock:
             self._conn.execute(
@@ -842,6 +1037,47 @@ class ReminderDatabase:
 
     # ----------------------------------------------------------- Internals
 
+    def _dependency_ids(self, step_id):
+        rows = self._conn.execute(
+            """
+            SELECT depends_on_step_id FROM step_dependencies
+            WHERE step_id = ?
+            """,
+            (step_id,),
+        ).fetchall()
+        ids = [row["depends_on_step_id"] for row in rows if row["depends_on_step_id"]]
+        if ids:
+            return ids
+        row = self._conn.execute(
+            "SELECT depends_on_step_id FROM steps WHERE id = ?",
+            (step_id,),
+        ).fetchone()
+        if row and row["depends_on_step_id"]:
+            return [row["depends_on_step_id"]]
+        return []
+
+    def _unfinished_dependency_titles(self, step_id):
+        with self._lock:
+            titles = []
+            for dep_id in self._dependency_ids(step_id):
+                dep = self._conn.execute(
+                    "SELECT title, status FROM steps WHERE id = ?",
+                    (dep_id,),
+                ).fetchone()
+                if dep is not None and dep["status"] != STEP_DONE:
+                    titles.append(dep["title"])
+            return titles
+
+    def _dependencies_satisfied_locked(self, step):
+        for dep_id in self._dependency_ids(step["id"]):
+            dep = self._conn.execute(
+                "SELECT status FROM steps WHERE id = ?",
+                (dep_id,),
+            ).fetchone()
+            if dep is None or dep["status"] != STEP_DONE:
+                return False
+        return True
+
     def _get_branch(self, branch_id):
         with self._lock:
             row = self._conn.execute(
@@ -850,12 +1086,12 @@ class ReminderDatabase:
         return dict(row) if row else None
 
     def _assert_step_can_complete(self, step):
-        if step["depends_on_step_id"]:
-            dep = self.get_step(step["depends_on_step_id"])
-            if dep and dep["status"] != STEP_DONE:
-                raise StepDependencyError(
-                    f"Нельзя закрыть шаг: сначала завершите «{dep['title']}»."
-                )
+        missing = self._unfinished_dependency_titles(step["id"])
+        if missing:
+            titles = ", ".join(f"«{title}»" for title in missing)
+            raise StepDependencyError(
+                f"Нельзя закрыть шаг: сначала завершите {titles}."
+            )
         if step["completion_type"] == COMPLETION_CHECKLIST:
             items = self.get_checklist_items(step["id"])
             if items and not all(item["is_checked"] for item in items):
@@ -953,15 +1189,8 @@ class ReminderDatabase:
                     ).fetchall()
                 ]
                 all_done = True
-                opened_waiting = False
                 for step in steps:
-                    dep_ok = True
-                    if step["depends_on_step_id"]:
-                        dep = self._conn.execute(
-                            "SELECT status FROM steps WHERE id = ?",
-                            (step["depends_on_step_id"],),
-                        ).fetchone()
-                        dep_ok = dep is not None and dep["status"] == STEP_DONE
+                    dep_ok = self._dependencies_satisfied_locked(step)
                     if step["status"] == STEP_DONE:
                         continue
                     all_done = False
@@ -972,24 +1201,18 @@ class ReminderDatabase:
                                 (STEP_BLOCKED, step["id"]),
                             )
                         continue
-                    if not opened_waiting:
-                        if step["status"] != STEP_WAITING:
-                            self._conn.execute(
-                                """
-                                UPDATE steps
-                                SET status = ?, waiting_since = COALESCE(waiting_since, ?)
-                                WHERE id = ?
-                                """,
-                                (STEP_WAITING, now_str(), step["id"]),
-                            )
-                        opened_waiting = True
-                    elif step["status"] not in (STEP_NOT_STARTED, STEP_BLOCKED):
-                        self._conn.execute(
-                            "UPDATE steps SET status = ? WHERE id = ?",
-                            (STEP_NOT_STARTED, step["id"]),
-                        )
+                    if step["status"] in (STEP_WAITING, STEP_OVERDUE):
+                        continue
+                    self._conn.execute(
+                        """
+                        UPDATE steps
+                        SET status = ?, waiting_since = COALESCE(waiting_since, ?)
+                        WHERE id = ?
+                        """,
+                        (STEP_WAITING, now_str(), step["id"]),
+                    )
 
-                if all_done and steps:
+                if all_done:
                     self._conn.execute(
                         "UPDATE branches SET status = ? WHERE id = ?",
                         (BRANCH_DONE, branch["id"]),

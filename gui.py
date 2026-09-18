@@ -19,6 +19,7 @@ from database import (
     STEP_DONE,
     STEP_OVERDUE,
     STEP_WAITING,
+    USER_TEMPLATE_PREFIX,
     StepDependencyError,
 )
 from notifications import NotificationManager
@@ -31,11 +32,14 @@ from templates import (
 )
 import autostart
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
 FILTER_ALL = "Все"
-QUICK_MINUTES = (1, 5, 15, 30)
+QUICK_MINUTES = (1, 5, 15, 30, 45, 60)
 REFRESH_INTERVAL_MS = 2000
+PISTACHIO = "#93C572"
+PISTACHIO_ACTIVE = "#7eaf5f"
+SNOOZE_MINUTES = 5
 
 TIME_FIELDS = (("часы", 23), ("минуты", 59), ("секунды", 59))
 
@@ -88,6 +92,279 @@ class PersistentDateEntry(DateEntry):
         self.state(["!pressed"])
 
 
+EDITABLE_CLASSES = {"TEntry", "Entry", "Text", "TSpinbox", "Spinbox", "DateEntry"}
+
+
+def _clipboard_widget(event):
+    widget = event.widget
+    try:
+        if widget.winfo_class() not in EDITABLE_CLASSES:
+            return None
+    except tk.TclError:
+        return None
+    return widget
+
+
+def _delete_selection(widget):
+    try:
+        widget.delete("sel.first", "sel.last")
+    except tk.TclError:
+        pass
+
+
+def _insert_text(widget, text):
+    for args in (("insert", text), (tk.INSERT, text)):
+        try:
+            widget.insert(*args)
+            return
+        except tk.TclError:
+            continue
+    try:
+        widget.insert(widget.index("insert"), text)
+    except tk.TclError:
+        try:
+            widget.insert("end", text)
+        except tk.TclError:
+            pass
+
+
+def bind_clipboard_shortcuts(root):
+    """ПКМ-меню и Ctrl+C/V/X/A у полей ввода (в т.ч. русская раскладка)."""
+
+    def _copy(event):
+        widget = _clipboard_widget(event)
+        if widget is None:
+            return None
+        try:
+            text = widget.selection_get()
+        except tk.TclError:
+            return "break"
+        widget.clipboard_clear()
+        widget.clipboard_append(text)
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(text)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _cut(event):
+        if _copy(event) is None:
+            return None
+        widget = _clipboard_widget(event)
+        if widget is not None:
+            _delete_selection(widget)
+        return "break"
+
+    def _paste(event):
+        widget = _clipboard_widget(event)
+        if widget is None:
+            return None
+        text = ""
+        try:
+            text = widget.clipboard_get()
+        except tk.TclError:
+            try:
+                text = root.clipboard_get()
+            except tk.TclError:
+                return "break"
+        _delete_selection(widget)
+        _insert_text(widget, text)
+        return "break"
+
+    def _select_all(event):
+        widget = _clipboard_widget(event)
+        if widget is None:
+            return None
+        try:
+            widget.tag_add("sel", "1.0", "end-1c")
+            return "break"
+        except tk.TclError:
+            pass
+        try:
+            widget.select_range(0, "end")
+            widget.icursor("end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _ctrl_key(event):
+        key = (event.keysym or "").lower()
+        mapping = {
+            "c": _copy,
+            "с": _copy,
+            "v": _paste,
+            "м": _paste,
+            "x": _cut,
+            "ч": _cut,
+            "a": _select_all,
+            "ф": _select_all,
+        }
+        handler = mapping.get(key)
+        if handler is None:
+            return None
+        return handler(event)
+
+    def _popup(event):
+        widget = _clipboard_widget(event)
+        if widget is None:
+            return None
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: _cut(event))
+        menu.add_command(label="Копировать", command=lambda: _copy(event))
+        menu.add_command(label="Вставить", command=lambda: _paste(event))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: _select_all(event))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    sequences = (
+        ("<Control-c>", _copy),
+        ("<Control-C>", _copy),
+        ("<Control-v>", _paste),
+        ("<Control-V>", _paste),
+        ("<Control-x>", _cut),
+        ("<Control-X>", _cut),
+        ("<Control-a>", _select_all),
+        ("<Control-A>", _select_all),
+        ("<Control-KeyPress>", _ctrl_key),
+        ("<Control-Insert>", _copy),
+        ("<Shift-Insert>", _paste),
+        ("<Shift-Delete>", _cut),
+        ("<Button-3>", _popup),
+    )
+    for sequence, handler in sequences:
+        root.bind_all(sequence, handler, add="+")
+        for cls in EDITABLE_CLASSES:
+            try:
+                root.bind_class(cls, sequence, handler, add="+")
+            except tk.TclError:
+                pass
+
+
+def _quick_label(minutes):
+    if minutes == 60:
+        return "+1 час"
+    return f"+{minutes} мин"
+
+
+def open_snooze_dialog(parent, db, reminder_id, on_done=None):
+    """Диалог: +5 минут или произвольная дата/время."""
+    reminder = db.get_reminder_by_id(reminder_id)
+    if reminder is None:
+        messagebox.showinfo("Нет записи", "Напоминание уже удалено.", parent=parent)
+        return
+    if reminder["status"] != STATUS_PENDING:
+        messagebox.showinfo(
+            "Нельзя отложить",
+            "Отложить можно только напоминание со статусом «Ожидает».",
+            parent=parent,
+        )
+        return
+
+    win = tk.Toplevel(parent)
+    win.title("Отложить напоминание")
+    win.transient(parent)
+    win.resizable(False, False)
+    frame = ttk.Frame(win, padding=12)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text=reminder["title"],
+        font=("Segoe UI", 9, "bold"),
+        wraplength=360,
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+    ttk.Label(frame, text="Дата и время:").grid(row=1, column=0, sticky="w", pady=4)
+    time_row = ttk.Frame(frame)
+    time_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=4)
+
+    date_entry = PersistentDateEntry(
+        time_row,
+        width=12,
+        locale="ru_RU",
+        date_pattern="yyyy-mm-dd",
+        mindate=date.today(),
+        font=("Segoe UI", 9),
+    )
+    date_entry.pack(side="left")
+    ttk.Label(time_row, text="в").pack(side="left", padx=8)
+
+    hour_var = tk.StringVar()
+    minute_var = tk.StringVar()
+    second_var = tk.StringVar()
+    target = datetime.now() + timedelta(minutes=SNOOZE_MINUTES)
+    date_entry.set_date(target.date())
+    hour_var.set(f"{target.hour:02d}")
+    minute_var.set(f"{target.minute:02d}")
+    second_var.set(f"{target.second:02d}")
+    for index, (variable, (_name, limit)) in enumerate(
+        zip((hour_var, minute_var, second_var), TIME_FIELDS)
+    ):
+        if index:
+            ttk.Label(time_row, text=":").pack(side="left")
+        ttk.Spinbox(
+            time_row,
+            from_=0,
+            to=limit,
+            textvariable=variable,
+            width=3,
+            wrap=True,
+            format="%02.0f",
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+
+    def read_due():
+        parts = []
+        for variable, (name, limit) in zip(
+            (hour_var, minute_var, second_var), TIME_FIELDS
+        ):
+            raw = variable.get().strip()
+            if not raw.isdigit():
+                raise ValueError(f"Поле «{name}» должно содержать число.")
+            value = int(raw)
+            if value > limit:
+                raise ValueError(f"Поле «{name}» не может быть больше {limit}.")
+            parts.append(value)
+        return datetime.combine(date_entry.get_date(), time(*parts))
+
+    def save():
+        try:
+            due = read_due()
+            db.snooze_reminder_to(reminder_id, due)
+        except ValueError as error:
+            messagebox.showerror("Не удалось отложить", str(error), parent=win)
+            return
+        win.destroy()
+        if on_done:
+            on_done()
+
+    def save_five():
+        try:
+            db.snooze_reminder(reminder_id, SNOOZE_MINUTES)
+        except ValueError as error:
+            messagebox.showerror("Не удалось отложить", str(error), parent=win)
+            return
+        win.destroy()
+        if on_done:
+            on_done()
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=2, column=0, columnspan=3, sticky="e", pady=(14, 0))
+    ttk.Button(buttons, text=f"На {SNOOZE_MINUTES} мин", command=save_five).pack(
+        side="left", padx=2
+    )
+    ttk.Button(buttons, text="Отложить", command=save).pack(side="right", padx=2)
+    ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right", padx=2)
+
+    win.grab_set()
+    win.wait_window()
+
+
 class ReminderApp:
     """Главное окно: список напоминаний, форма добавления и иконка в трее."""
 
@@ -95,7 +372,10 @@ class ReminderApp:
         self.db = db
         self.root = tk.Tk()
         self.notifier = NotificationManager(
-            db, self.root, on_change=self.refresh_reminders
+            db,
+            self.root,
+            on_change=self.refresh_reminders,
+            snooze_dialog=self.open_snooze_for_reminder,
         )
 
         self._tray_icon = None
@@ -122,6 +402,7 @@ class ReminderApp:
             pass
         style.configure("Treeview", rowheight=26)
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        bind_clipboard_shortcuts(self.root)
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -164,7 +445,6 @@ class ReminderApp:
             locale="ru_RU",
             date_pattern="yyyy-mm-dd",
             mindate=date.today(),
-            state="readonly",
             font=("Segoe UI", 9),
         )
         self.date_entry.pack(side="left")
@@ -199,14 +479,22 @@ class ReminderApp:
         for minutes in QUICK_MINUTES:
             ttk.Button(
                 quick_row,
-                text=f"+{minutes} мин",
+                text=_quick_label(minutes),
                 width=8,
                 command=lambda m=minutes: self.set_quick_time(m),
             ).pack(side="left", padx=2)
 
-        ttk.Button(form, text="Добавить напоминание", command=self.add_reminder).grid(
-            row=4, column=1, sticky="e", padx=(8, 0), pady=(10, 0)
-        )
+        tk.Button(
+            form,
+            text="Добавить напоминание",
+            command=self.add_reminder,
+            bg=PISTACHIO,
+            activebackground=PISTACHIO_ACTIVE,
+            relief="raised",
+            padx=10,
+            pady=4,
+            font=("Segoe UI", 9),
+        ).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
 
         self.set_quick_time(5)
 
@@ -241,6 +529,9 @@ class ReminderApp:
             side="right", padx=2
         )
         ttk.Button(toolbar, text="Отметить готовым", command=self.mark_as_done).pack(
+            side="right", padx=2
+        )
+        ttk.Button(toolbar, text="Отложить", command=self.snooze_selected_reminder).pack(
             side="right", padx=2
         )
 
@@ -301,6 +592,13 @@ class ReminderApp:
         )
         self.template_box.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
         self.template_box.bind("<<ComboboxSelected>>", lambda _e: self._on_template_change())
+        ttk.Button(
+            form, text="Конструктор процессов", command=self.open_process_builder
+        ).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=3)
+        self.delete_template_btn = ttk.Button(
+            form, text="Удалить шаблон", command=self.delete_selected_template
+        )
+        self.delete_template_btn.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=3)
 
         ttk.Label(form, text="Название:").grid(row=1, column=0, sticky="w", pady=3)
         self.process_title_var = tk.StringVar()
@@ -308,8 +606,18 @@ class ReminderApp:
             row=1, column=1, sticky="ew", padx=(8, 0), pady=3
         )
 
-        self.guard_frame = ttk.LabelFrame(form, text="Данные договора охраны", padding=8)
-        self.guard_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._guard_open = False
+        self.guard_wrap = ttk.Frame(form)
+        self.guard_wrap.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.guard_wrap.columnconfigure(0, weight=1)
+        self.guard_toggle_btn = ttk.Button(
+            self.guard_wrap,
+            text="Показать/Скрыть данные договора охраны",
+            command=self._toggle_guard_fields,
+        )
+        self.guard_toggle_btn.grid(row=0, column=0, sticky="w")
+        self.guard_frame = ttk.Frame(self.guard_wrap, padding=(0, 6, 0, 0))
+        self.guard_frame.grid(row=1, column=0, sticky="ew")
         self.guard_frame.columnconfigure(1, weight=1)
         self.guard_vars = {}
         for index, (key, label) in enumerate(GUARD_FIELDS):
@@ -321,10 +629,12 @@ class ReminderApp:
             ttk.Entry(self.guard_frame, textvariable=var).grid(
                 row=index, column=1, sticky="ew", padx=(8, 0), pady=2
             )
+        self._sync_guard_fields()
 
         ttk.Button(form, text="Создать процесс", command=self.create_process).grid(
             row=3, column=1, sticky="e", pady=(10, 0)
         )
+        self.refresh_template_choices()
         self._on_template_change()
 
     def _build_process_tree(self, parent):
@@ -343,6 +653,11 @@ class ReminderApp:
             toolbar,
             text="Расписание уведомлений",
             command=self.edit_selected_notify_schedule,
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            toolbar,
+            text="Завершить процесс",
+            command=self.finish_selected_process,
         ).pack(side="left", padx=2)
 
         wrapper = ttk.Frame(parent)
@@ -374,16 +689,73 @@ class ReminderApp:
         label = self.template_var.get()
         is_guard = label == TEMPLATE_LABELS[TEMPLATE_GUARD]
         if is_guard:
+            self.guard_wrap.grid()
+            self._sync_guard_fields()
+        else:
+            self._guard_open = False
+            self.guard_wrap.grid_remove()
+            self._sync_guard_fields()
+        is_user = str(self._selected_template_type()).startswith(USER_TEMPLATE_PREFIX)
+        if hasattr(self, "delete_template_btn"):
+            self.delete_template_btn.state(["!disabled"] if is_user else ["disabled"])
+
+    def _sync_guard_fields(self):
+        if not hasattr(self, "guard_frame"):
+            return
+        if self._guard_open:
             self.guard_frame.grid()
         else:
             self.guard_frame.grid_remove()
 
+    def _toggle_guard_fields(self):
+        self._guard_open = not self._guard_open
+        self._sync_guard_fields()
+
+    def refresh_template_choices(self):
+        choices = list(TEMPLATE_LABELS.items())
+        for row in self.db.list_process_templates():
+            choices.append((f"{USER_TEMPLATE_PREFIX}{row['id']}", row["name"]))
+        self._template_choices = choices
+        labels = [label for _key, label in choices]
+        current = self.template_var.get()
+        self.template_box["values"] = labels
+        if current not in labels:
+            self.template_var.set(labels[0] if labels else "")
+            self._on_template_change()
+
+    def _template_display_name(self, template_type):
+        if template_type in TEMPLATE_LABELS:
+            return TEMPLATE_LABELS[template_type]
+        if str(template_type).startswith(USER_TEMPLATE_PREFIX):
+            raw = str(template_type)[len(USER_TEMPLATE_PREFIX) :]
+            try:
+                row = self.db.get_process_template(int(raw))
+            except ValueError:
+                row = None
+            if row:
+                return row["name"]
+        return template_type or ""
+
     def _selected_template_type(self):
         label = self.template_var.get()
-        for key, value in TEMPLATE_LABELS.items():
+        for key, value in getattr(self, "_template_choices", TEMPLATE_LABELS.items()):
             if value == label:
                 return key
         return TEMPLATE_EDO
+
+    def open_process_builder(self):
+        try:
+            from process_builder import open_process_builder
+            open_process_builder(
+                self.db,
+                on_saved=lambda: self.root.after(0, self.refresh_template_choices),
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Конструктор процессов",
+                f"Не удалось открыть конструктор: {error}\n"
+                "Установите зависимость pywebview: pip install -r requirements.txt",
+            )
 
     def create_process(self):
         template_type = self._selected_template_type()
@@ -408,6 +780,8 @@ class ReminderApp:
     def refresh_processes(self):
         if self._shutting_down or not hasattr(self, "process_tree"):
             return
+        if hasattr(self, "template_box"):
+            self.refresh_template_choices()
         selected = self.process_tree.selection()
         for item in self.process_tree.get_children():
             self.process_tree.delete(item)
@@ -421,7 +795,8 @@ class ReminderApp:
                 text=process["title"],
                 values=(
                     process["status"],
-                    TEMPLATE_LABELS.get(process["template_type"], ""),
+                    TEMPLATE_LABELS.get(process["template_type"])
+                    or self._template_display_name(process["template_type"]),
                     "",
                 ),
                 open=True,
@@ -445,6 +820,8 @@ class ReminderApp:
                 )
                 for step in branch["steps"]:
                     detail = step.get("result_note") or step.get("completion_type")
+                    if step["status"] == STEP_WAITING and step.get("next_due"):
+                        detail = f"сработает {step['next_due']}"
                     if step["status"] == STEP_OVERDUE or step.get("stale"):
                         tag = "stale"
                     elif step["status"] == STEP_DONE:
@@ -479,6 +856,62 @@ class ReminderApp:
         if not iid.startswith("s-"):
             return None
         return int(iid.split("-", 1)[1])
+
+    def _selected_process_id(self):
+        selection = self.process_tree.selection()
+        if not selection:
+            return None
+        iid = selection[0]
+        while iid:
+            if iid.startswith("p-"):
+                return int(iid.split("-", 1)[1])
+            iid = self.process_tree.parent(iid)
+        return None
+
+    def finish_selected_process(self):
+        process_id = self._selected_process_id()
+        if process_id is None:
+            messagebox.showinfo(
+                "Ничего не выбрано",
+                "Выберите процесс (или его ветку/шаг) в дереве.",
+            )
+            return
+        tree = self.db.get_process_tree(process_id)
+        if tree is None:
+            return
+        title = tree.get("title") or f"#{process_id}"
+        if not messagebox.askyesno(
+            "Завершить процесс",
+            f"Завершить процесс «{title}»?\n\n"
+            "Все оставшиеся шаги будут отмечены выполненными, "
+            "пустые ветки закроются, напоминания шагов снимутся.",
+        ):
+            return
+        self.db.finish_process(process_id)
+        self.refresh_processes()
+        self.refresh_reminders()
+
+    def delete_selected_template(self):
+        template_type = self._selected_template_type()
+        if not str(template_type).startswith(USER_TEMPLATE_PREFIX):
+            messagebox.showinfo(
+                "Нельзя удалить",
+                "Встроенные шаблоны «ЭДО-договор» и «Охрана объекта» удалить нельзя.",
+            )
+            return
+        raw_id = str(template_type)[len(USER_TEMPLATE_PREFIX) :]
+        try:
+            template_id = int(raw_id)
+        except ValueError:
+            return
+        name = self.template_var.get()
+        if not messagebox.askyesno(
+            "Удалить шаблон",
+            f"Удалить шаблон «{name}»?\nЗапущенные процессы по нему останутся.",
+        ):
+            return
+        self.db.delete_process_template(template_id)
+        self.refresh_template_choices()
 
     def complete_selected_step(self):
         step_id = self._selected_step_id()
@@ -773,6 +1206,20 @@ class ReminderApp:
             return
         self.db.update_status(reminder_id, STATUS_DONE)
         self.refresh_reminders()
+
+    def snooze_selected_reminder(self):
+        reminder_id = self._require_selection()
+        if reminder_id is None:
+            return
+        self.open_snooze_for_reminder(reminder_id)
+
+    def open_snooze_for_reminder(self, reminder_id, parent=None):
+        open_snooze_dialog(
+            parent or self.root,
+            self.db,
+            reminder_id,
+            on_done=self.refresh_reminders,
+        )
 
     def mark_as_cancelled(self):
         reminder_id = self._require_selection()
