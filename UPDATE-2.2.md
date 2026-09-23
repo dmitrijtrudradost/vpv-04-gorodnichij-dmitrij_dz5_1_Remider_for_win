@@ -65,7 +65,7 @@ reminders.db.bak-2.1
 В PowerShell, в папке установки:
 
 ```powershell
-cd C:\napominalka
+cd C:\Program Files (x86)\Napominalka
 pip install -r requirements.txt
 ```
 

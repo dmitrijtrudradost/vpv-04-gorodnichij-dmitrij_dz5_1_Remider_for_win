@@ -3,11 +3,14 @@
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk
+from datetime import date, datetime, time, timedelta
+from tkinter import messagebox, ttk
 
 import database as db_module
 from database import STEP_DONE, StepDependencyError
 from templates import ACTION_CHECKLIST, ACTION_EDO_SIGN, ACTION_GUARD_SIGN
+
+SNOOZE_TIME_FIELDS = (("часы", 23), ("минуты", 59), ("секунды", 59))
 
 CHECK_INTERVAL_SECONDS = 1
 UI_QUEUE_POLL_MS = 200
@@ -302,16 +305,25 @@ class NotificationManager:
             self._notify_change()
             close_popup()
 
-        def snooze():
-            rid = reminder.get("id")
-            close_popup()
-            if not rid:
+        snooze_panel = None
+
+        def show_actions():
+            if snooze_panel is not None:
+                snooze_panel.pack_forget()
+            buttons.pack(anchor="e")
+            self._place_popup(popup)
+
+        def show_snooze():
+            nonlocal snooze_panel
+            if not reminder.get("id"):
                 return
-            if self._snooze_dialog:
-                self._snooze_dialog(rid)
-            else:
-                self.db.snooze_reminder(rid, SNOOZE_MINUTES)
-                self._notify_change()
+            if snooze_panel is None:
+                snooze_panel = self._make_inline_snooze_panel(
+                    popup, reminder["id"], show_actions, close_popup
+                )
+            buttons.pack_forget()
+            snooze_panel.pack(anchor="w", fill="x", pady=(4, 0))
+            self._place_popup(popup)
 
         action = (step or {}).get("action_kind") or ""
         if step and action == ACTION_EDO_SIGN:
@@ -323,7 +335,7 @@ class NotificationManager:
             ttk.Button(
                 buttons, text="Ещё нет, договор в ожидании", command=postpone_wait
             ).pack(side="left", padx=(0, 6))
-            ttk.Button(buttons, text="Отложить", command=snooze).pack(
+            ttk.Button(buttons, text="Отложить", command=show_snooze).pack(
                 side="left", padx=(0, 6)
             )
             popup.protocol("WM_DELETE_WINDOW", postpone_wait)
@@ -339,7 +351,7 @@ class NotificationManager:
                     text="Продолжать ждать",
                     command=lambda: complete_step("Продолжаем ждать подпись"),
                 ).pack(side="left", padx=(0, 6))
-                ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                ttk.Button(buttons, text="Отложить", command=show_snooze).pack(
                     side="left", padx=(0, 6)
                 )
                 popup.protocol("WM_DELETE_WINDOW", postpone_wait)
@@ -347,7 +359,7 @@ class NotificationManager:
                 ttk.Button(
                     buttons, text="Ещё ждём подпись заказчика", command=postpone_wait
                 ).pack(side="left", padx=(0, 6))
-                ttk.Button(buttons, text="Отложить", command=snooze).pack(
+                ttk.Button(buttons, text="Отложить", command=show_snooze).pack(
                     side="left", padx=(0, 6)
                 )
                 ttk.Button(buttons, text="Закрыть", command=postpone_wait).pack(side="left")
@@ -356,7 +368,7 @@ class NotificationManager:
             ttk.Button(buttons, text="Готово", command=mark_done).pack(
                 side="left", padx=(0, 6)
             )
-            ttk.Button(buttons, text="Отложить", command=snooze).pack(
+            ttk.Button(buttons, text="Отложить", command=show_snooze).pack(
                 side="left", padx=(0, 6)
             )
             ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
@@ -370,6 +382,93 @@ class NotificationManager:
 
         popup.lift()
         popup.focus_force()
+
+    def _make_inline_snooze_panel(self, popup, reminder_id, on_back, on_close):
+        """Дата и время отложения в том же окне напоминания, без второго Toplevel."""
+        from gui import PersistentDateEntry
+
+        panel = ttk.Frame(popup)
+        ttk.Label(panel, text="Отложить до:").pack(anchor="w")
+        time_row = ttk.Frame(panel)
+        time_row.pack(anchor="w", pady=(4, 8))
+
+        date_entry = PersistentDateEntry(
+            time_row,
+            width=12,
+            locale="ru_RU",
+            date_pattern="yyyy-mm-dd",
+            mindate=date.today(),
+            font=("Segoe UI", 9),
+        )
+        date_entry.pack(side="left")
+        ttk.Label(time_row, text="в").pack(side="left", padx=8)
+
+        hour_var = tk.StringVar()
+        minute_var = tk.StringVar()
+        second_var = tk.StringVar()
+        target = datetime.now() + timedelta(minutes=SNOOZE_MINUTES)
+        date_entry.set_date(target.date())
+        hour_var.set(f"{target.hour:02d}")
+        minute_var.set(f"{target.minute:02d}")
+        second_var.set(f"{target.second:02d}")
+        for index, (variable, (_name, limit)) in enumerate(
+            zip((hour_var, minute_var, second_var), SNOOZE_TIME_FIELDS)
+        ):
+            if index:
+                ttk.Label(time_row, text=":").pack(side="left")
+            ttk.Spinbox(
+                time_row,
+                from_=0,
+                to=limit,
+                textvariable=variable,
+                width=3,
+                wrap=True,
+                format="%02.0f",
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+
+        def read_due():
+            parts = []
+            for variable, (name, limit) in zip(
+                (hour_var, minute_var, second_var), SNOOZE_TIME_FIELDS
+            ):
+                raw = variable.get().strip()
+                if not raw.isdigit():
+                    raise ValueError(f"Поле «{name}» должно содержать число.")
+                value = int(raw)
+                if value > limit:
+                    raise ValueError(f"Поле «{name}» не может быть больше {limit}.")
+                parts.append(value)
+            return datetime.combine(date_entry.get_date(), time(*parts))
+
+        def save():
+            try:
+                self.db.snooze_reminder_to(reminder_id, read_due())
+            except ValueError as error:
+                messagebox.showerror("Не удалось отложить", str(error), parent=popup)
+                return
+            self._notify_change()
+            on_close()
+
+        def save_five():
+            try:
+                self.db.snooze_reminder(reminder_id, SNOOZE_MINUTES)
+            except ValueError as error:
+                messagebox.showerror("Не удалось отложить", str(error), parent=popup)
+                return
+            self._notify_change()
+            on_close()
+
+        actions = ttk.Frame(panel)
+        actions.pack(anchor="e")
+        ttk.Button(
+            actions, text=f"На {SNOOZE_MINUTES} мин", command=save_five
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Отложить", command=save).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Назад", command=on_back).pack(side="left")
+        return panel
 
     def _show_checklist(self, step_id):
         """Модальное окно блокирующего чек-листа."""
