@@ -74,6 +74,7 @@ class NotificationManager:
         self._winotify_available = WINOTIFY_IMPORTED
         self._toaster = None
         self._open_popups = []
+        self._last_purge_at = None
 
     @property
     def backend_name(self):
@@ -139,7 +140,17 @@ class NotificationManager:
             self._stop_event.wait(CHECK_INTERVAL_SECONDS)
 
     def _tick(self):
-        changed = self.db.mark_overdue() > 0
+        now = datetime.now()
+        if self._last_purge_at is None or (now - self._last_purge_at).total_seconds() >= 60:
+            self._last_purge_at = now
+            if self.db.purge_completed_reminders() > 0:
+                changed = True
+            else:
+                changed = False
+        else:
+            changed = False
+        if self.db.mark_overdue() > 0:
+            changed = True
         if self.db.activate_due_deferred_branches() > 0:
             changed = True
         if self.db.ensure_waiting_step_reminders() > 0:

@@ -534,6 +534,8 @@ class ReminderApp:
         ttk.Button(toolbar, text="Отложить", command=self.snooze_selected_reminder).pack(
             side="right", padx=2
         )
+        self.selection_var = tk.StringVar(value="Выбрано: 0")
+        ttk.Label(toolbar, textvariable=self.selection_var).pack(side="left", padx=(8, 0))
 
     def _build_list(self, parent):
         wrapper = ttk.Frame(parent)
@@ -541,7 +543,7 @@ class ReminderApp:
 
         columns = ("id", "title", "due_time", "status", "description")
         self.tree = ttk.Treeview(
-            wrapper, columns=columns, show="headings", selectmode="browse"
+            wrapper, columns=columns, show="headings", selectmode="extended"
         )
 
         headings = {
@@ -564,7 +566,10 @@ class ReminderApp:
         for status, color in STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
 
+        self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<Delete>", lambda _e: self.delete_reminder())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_selection_label())
 
     def _build_status_bar(self):
         self.status_var = tk.StringVar()
@@ -1135,12 +1140,13 @@ class ReminderApp:
         """Перечитывает список из базы с учётом фильтра.
 
         Вызывается и по таймеру, и из фонового потока (через очередь), поэтому
-        сохраняет выделенную строку, чтобы список не «прыгал» под курсором.
+        сохраняет весь выбор и прокрутку, чтобы список не «прыгал» под курсором.
         """
         if self._shutting_down:
             return
 
-        selected = self._selected_id()
+        selected = list(self.tree.selection())
+        y_pos = self.tree.yview()[0] if self.tree.get_children() else 0.0
 
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1164,8 +1170,10 @@ class ReminderApp:
                 tags=(reminder["status"],),
             )
 
-        if selected is not None and self.tree.exists(str(selected)):
-            self.tree.selection_set(str(selected))
+        still = [iid for iid in selected if self.tree.exists(iid)]
+        if still:
+            self.tree.selection_set(still)
+        self.tree.yview_moveto(y_pos)
 
         self.update_status_bar()
         self.refresh_processes()
@@ -1179,14 +1187,22 @@ class ReminderApp:
     def update_status_bar(self):
         counts = self.db.get_counts_by_status()
         total = sum(counts.values())
+        selected_n = len(self.tree.selection()) if hasattr(self, "tree") else 0
         self.status_var.set(
             f"Всего: {total}    "
             f"Ожидает: {counts[STATUS_PENDING]}    "
             f"Готово: {counts[STATUS_DONE]}    "
             f"Просрочено: {counts[STATUS_OVERDUE]}    "
             f"Отменено: {counts[STATUS_CANCELLED]}    "
+            f"Выбрано: {selected_n}    "
             f"|  Уведомления: {self.notifier.backend_name}"
         )
+        self._update_selection_label()
+
+    def _update_selection_label(self):
+        if not hasattr(self, "selection_var") or not hasattr(self, "tree"):
+            return
+        self.selection_var.set(f"Выбрано: {len(self.tree.selection())}")
 
     def _selected_id(self):
         selection = self.tree.selection()
@@ -1194,24 +1210,45 @@ class ReminderApp:
             return None
         return int(selection[0])
 
+    def _selected_ids(self):
+        return [int(iid) for iid in self.tree.selection()]
+
     def _require_selection(self):
         reminder_id = self._selected_id()
         if reminder_id is None:
             messagebox.showinfo("Ничего не выбрано", "Выберите напоминание в списке.")
         return reminder_id
 
+    def on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region in ("heading", "separator"):
+            return None
+        row = self.tree.identify_row(event.y)
+        if not row:
+            self.tree.selection_remove(*self.tree.selection())
+            self._update_selection_label()
+            return "break"
+        if event.state & 0x0001:
+            return None
+        self.tree.selection_toggle(row)
+        self._update_selection_label()
+        return "break"
+
     def mark_as_done(self):
-        reminder_id = self._require_selection()
-        if reminder_id is None:
+        ids = self._selected_ids()
+        if not ids:
+            messagebox.showinfo("Ничего не выбрано", "Выберите напоминание в списке.")
             return
-        self.db.update_status(reminder_id, STATUS_DONE)
+        for reminder_id in ids:
+            self.db.update_status(reminder_id, STATUS_DONE)
         self.refresh_reminders()
 
     def snooze_selected_reminder(self):
-        reminder_id = self._require_selection()
-        if reminder_id is None:
+        ids = self._selected_ids()
+        if len(ids) != 1:
+            messagebox.showinfo("Выберите одно напоминание", "Отложить можно только одну запись.")
             return
-        self.open_snooze_for_reminder(reminder_id)
+        self.open_snooze_for_reminder(ids[0])
 
     def open_snooze_for_reminder(self, reminder_id, parent=None):
         open_snooze_dialog(
@@ -1222,33 +1259,49 @@ class ReminderApp:
         )
 
     def mark_as_cancelled(self):
-        reminder_id = self._require_selection()
-        if reminder_id is None:
+        ids = self._selected_ids()
+        if not ids:
+            messagebox.showinfo("Ничего не выбрано", "Выберите напоминание в списке.")
             return
-        self.db.update_status(reminder_id, STATUS_CANCELLED)
+        for reminder_id in ids:
+            self.db.update_status(reminder_id, STATUS_CANCELLED)
         self.refresh_reminders()
 
     def delete_reminder(self):
-        reminder_id = self._require_selection()
-        if reminder_id is None:
+        ids = self._selected_ids()
+        if not ids:
+            messagebox.showinfo("Ничего не выбрано", "Выберите напоминание в списке.")
             return
-
-        reminder = self.db.get_reminder_by_id(reminder_id)
-        if reminder is None:
-            self.refresh_reminders()
-            return
-
-        if messagebox.askyesno(
-            "Удаление", f"Удалить напоминание «{reminder['title']}»?"
+        if not messagebox.askyesno(
+            "Удаление", f"Удалить выбранные напоминания ({len(ids)})?"
         ):
-            self.db.delete_reminder(reminder_id)
-            self.refresh_reminders()
-
-    def on_double_click(self, _event):
-        """Показывает подробности напоминания по двойному клику."""
-        reminder_id = self._selected_id()
-        if reminder_id is None:
             return
+        removable = []
+        skipped = 0
+        for reminder_id in ids:
+            reminder = self.db.get_reminder_by_id(reminder_id)
+            if reminder is None:
+                continue
+            if reminder.get("step_id") and reminder.get("status") == STATUS_PENDING:
+                skipped += 1
+                continue
+            removable.append(reminder_id)
+        if removable:
+            self.db.delete_reminders(removable)
+        self.refresh_reminders()
+        if skipped:
+            messagebox.showinfo(
+                "Не удалено",
+                f"{skipped} напоминаний шагов процесса не удалены — "
+                "закройте шаг на вкладке «Процессы».",
+            )
+
+    def on_double_click(self, event):
+        """Показывает подробности напоминания по двойному клику."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        reminder_id = int(row)
 
         reminder = self.db.get_reminder_by_id(reminder_id)
         if reminder is None:

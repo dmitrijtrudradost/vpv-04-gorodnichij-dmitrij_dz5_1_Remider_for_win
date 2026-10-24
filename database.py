@@ -46,6 +46,7 @@ STEP_OVERDUE = "просрочен"
 STEP_BLOCKED = "заблокирован"
 
 OVERDUE_GRACE_SECONDS = 1800
+COMPLETED_RETENTION_HOURS = 24
 WORK_START_HOUR = 9
 WORK_END_HOUR = 18
 
@@ -293,6 +294,16 @@ class ReminderDatabase:
             ]
             if "step_id" not in columns:
                 self._conn.execute("ALTER TABLE reminders ADD COLUMN step_id INTEGER")
+            if "completed_at" not in columns:
+                self._conn.execute("ALTER TABLE reminders ADD COLUMN completed_at TEXT")
+                self._conn.execute(
+                    """
+                    UPDATE reminders
+                    SET completed_at = ?
+                    WHERE status = ? AND (completed_at IS NULL OR completed_at = '')
+                    """,
+                    (now_str(), STATUS_DONE),
+                )
             step_columns = [
                 row[1]
                 for row in self._conn.execute("PRAGMA table_info(steps)").fetchall()
@@ -379,22 +390,61 @@ class ReminderDatabase:
         if status not in ALL_STATUSES:
             raise ValueError(f"Неизвестный статус: {status!r}")
 
+        completed_at = now_str() if status == STATUS_DONE else None
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE reminders SET status = ? WHERE id = ?",
-                (status, reminder_id),
+                "UPDATE reminders SET status = ?, completed_at = ? WHERE id = ?",
+                (status, completed_at, reminder_id),
             )
             self._conn.commit()
             return cursor.rowcount > 0
 
-    def delete_reminder(self, reminder_id):
-        """Удаляет напоминание. Возвращает True, если запись найдена."""
+    def delete_reminders(self, reminder_ids):
+        """Удаляет несколько напоминаний одной транзакцией. Возвращает число удалённых."""
+        ids = []
+        seen = set()
+        for raw in reminder_ids or ():
+            try:
+                reminder_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if reminder_id in seen:
+                continue
+            seen.add(reminder_id)
+            ids.append(reminder_id)
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
         with self._lock:
+            self._conn.execute(
+                f"UPDATE steps SET reminder_id = NULL WHERE reminder_id IN ({placeholders})",
+                ids,
+            )
             cursor = self._conn.execute(
-                "DELETE FROM reminders WHERE id = ?", (reminder_id,)
+                f"DELETE FROM reminders WHERE id IN ({placeholders})",
+                ids,
             )
             self._conn.commit()
-            return cursor.rowcount > 0
+            return cursor.rowcount
+
+    def delete_reminder(self, reminder_id):
+        """Удаляет напоминание. Возвращает True, если запись найдена."""
+        return self.delete_reminders([reminder_id]) > 0
+
+    def purge_completed_reminders(self):
+        """Удаляет записи «Готово», закрытые больше суток назад."""
+        cutoff = datetime.now() - timedelta(hours=COMPLETED_RETENTION_HOURS)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id FROM reminders
+                WHERE status = ?
+                  AND completed_at IS NOT NULL AND completed_at != ''
+                  AND completed_at < ?
+                """,
+                (STATUS_DONE, to_db_format(cutoff)),
+            ).fetchall()
+        return self.delete_reminders([row["id"] for row in rows])
 
     def snooze_reminder(self, reminder_id, minutes):
         """Переносит напоминание на ``minutes`` минут вперёд от текущего момента."""
@@ -408,7 +458,11 @@ class ReminderDatabase:
             raise ValueError("Новое время должно быть в будущем.")
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE reminders SET due_time = ?, status = ? WHERE id = ?",
+                """
+                UPDATE reminders
+                SET due_time = ?, status = ?, completed_at = NULL
+                WHERE id = ?
+                """,
                 (to_db_format(new_due_time), STATUS_PENDING, reminder_id),
             )
             self._conn.commit()
@@ -1131,8 +1185,12 @@ class ReminderDatabase:
 
     def _cancel_step_reminders(self, step_id):
         self._conn.execute(
-            "UPDATE reminders SET status = ? WHERE step_id = ? AND status = ?",
-            (STATUS_DONE, step_id, STATUS_PENDING),
+            """
+            UPDATE reminders
+            SET status = ?, completed_at = ?
+            WHERE step_id = ? AND status = ?
+            """,
+            (STATUS_DONE, now_str(), step_id, STATUS_PENDING),
         )
 
     def _compute_next_due(self, step):
