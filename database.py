@@ -99,8 +99,10 @@ def is_weekend(day):
     return day.weekday() >= 5
 
 
-def next_workday(day):
+def next_workday(day, allow_weekends=False):
     candidate = day + timedelta(days=1)
+    if allow_weekends:
+        return candidate
     while is_weekend(candidate):
         candidate += timedelta(days=1)
     return candidate
@@ -116,7 +118,7 @@ def add_workdays(start, count):
     return current
 
 
-def clamp_to_work_hours(moment, end_hour=WORK_END_HOUR, end_minute=0):
+def clamp_to_work_hours(moment, end_hour=WORK_END_HOUR, end_minute=0, allow_weekends=False):
     """Сдвигает момент в будни 09:00 … граница включительно (по умолчанию 18:00)."""
     current = moment
     after_end = (current.hour, current.minute, current.second, current.microsecond) > (
@@ -125,17 +127,18 @@ def clamp_to_work_hours(moment, end_hour=WORK_END_HOUR, end_minute=0):
         0,
         0,
     )
-    if is_weekend(current.date()) or after_end:
-        nxt = next_workday(current.date())
+    skip_day = (not allow_weekends and is_weekend(current.date())) or after_end
+    if skip_day:
+        nxt = next_workday(current.date(), allow_weekends=allow_weekends)
         return datetime.combine(nxt, time(WORK_START_HOUR, 0))
     if current.hour < WORK_START_HOUR:
         return current.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
     return current.replace(microsecond=0)
 
 
-def next_workday_morning(moment=None, hour=WORK_START_HOUR, minute=0):
+def next_workday_morning(moment=None, hour=WORK_START_HOUR, minute=0, allow_weekends=False):
     base = moment or datetime.now()
-    nxt = next_workday(base.date())
+    nxt = next_workday(base.date(), allow_weekends=allow_weekends)
     return datetime.combine(nxt, time(hour, minute))
 
 
@@ -161,29 +164,34 @@ def parse_notify_until(text):
         return WORK_END_HOUR, 0
 
 
-def format_notify_label(rules, notify_until="18:00"):
+def format_notify_label(rules, notify_until="18:00", notify_weekends=False):
     """Краткая сводка правил эскалации для колонки дерева."""
     if not rules:
         return "—"
     until = format_hhmm(*parse_notify_until(notify_until))
+    days = "пн–вс" if notify_weekends else "пн–пт"
     parts = []
     for rule in rules:
         kind = rule["interval_type"]
-        if kind == ESC_FIRST:
-            minutes = int(rule.get("delay_minutes") or 0)
-            hours, rest = divmod(max(minutes, 0), 60)
-            if rest:
-                parts.append(f"через {hours} ч {rest} мин")
-            else:
-                parts.append(f"через {max(hours, 1)} ч")
-        elif kind == ESC_REPEAT:
+        if kind == ESC_REPEAT or rule.get("fixed_time"):
             stamp = rule.get("fixed_time") or "09:00"
-            parts.append(f"пн–пт {stamp}–{until}")
-        elif kind == ESC_FREQUENT:
-            minutes = int(rule.get("delay_minutes") or 0)
-            hours = max(1, minutes // 60) if minutes else 3
-            parts.append(f"каждые {hours} ч")
+            parts.append(f"{days} {stamp}–{until}")
+            continue
+        minutes = int(rule.get("delay_minutes") or 0)
+        hours, rest = divmod(max(minutes, 0), 60)
+        if kind == ESC_FREQUENT:
+            parts.append(f"каждые {max(hours, 1)} ч")
+        elif rest:
+            parts.append(f"через {hours} ч {rest} мин")
+        else:
+            parts.append(f"через {max(hours, 1)} ч")
     return " → ".join(parts) if parts else "—"
+
+
+def property_active_from_date(value):
+    """Дата «действует с» или None, если свойство уже можно применять."""
+    parsed = parse_dt(value)
+    return parsed.date() if parsed else None
 
 
 class ReminderDatabase:
@@ -311,6 +319,18 @@ class ReminderDatabase:
             if step_columns and "notify_until" not in step_columns:
                 self._conn.execute(
                     "ALTER TABLE steps ADD COLUMN notify_until TEXT NOT NULL DEFAULT '18:00'"
+                )
+            if step_columns and "checklist_active_from" not in step_columns:
+                self._conn.execute(
+                    "ALTER TABLE steps ADD COLUMN checklist_active_from TEXT NOT NULL DEFAULT ''"
+                )
+            if step_columns and "escalation_active_from" not in step_columns:
+                self._conn.execute(
+                    "ALTER TABLE steps ADD COLUMN escalation_active_from TEXT NOT NULL DEFAULT ''"
+                )
+            if step_columns and "notify_weekends" not in step_columns:
+                self._conn.execute(
+                    "ALTER TABLE steps ADD COLUMN notify_weekends INTEGER NOT NULL DEFAULT 0"
                 )
             self._conn.execute(
                 """
@@ -467,6 +487,36 @@ class ReminderDatabase:
             )
             self._conn.commit()
             return cursor.rowcount > 0
+
+    def resume_reminders(self, reminder_ids, new_due_time):
+        """Возобновляет только выбранные записи со статусом «Просрочено»."""
+        if isinstance(new_due_time, datetime) and new_due_time <= datetime.now():
+            raise ValueError("Новое время должно быть в будущем.")
+        ids = []
+        seen = set()
+        for raw in reminder_ids or ():
+            try:
+                reminder_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if reminder_id in seen:
+                continue
+            seen.add(reminder_id)
+            ids.append(reminder_id)
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE reminders
+                SET due_time = ?, status = ?, completed_at = NULL
+                WHERE id IN ({placeholders}) AND status = ?
+                """,
+                [to_db_format(new_due_time), STATUS_PENDING, *ids, STATUS_OVERDUE],
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     def mark_overdue(self):
         """Переводит в «Просрочено» ожидающие одиночные записи, опоздавшие больше минуты.
@@ -696,8 +746,9 @@ class ReminderDatabase:
                             INSERT INTO steps (
                                 branch_id, title, order_index, status, completion_type,
                                 action_kind, depends_on_step_id, waiting_since, escalation_index,
-                                notify_until
-                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?)
+                                notify_until, checklist_active_from, escalation_active_from,
+                                notify_weekends
+                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?, ?, ?)
                             """,
                             (
                                 branch_id,
@@ -708,6 +759,9 @@ class ReminderDatabase:
                                 step_spec.get("action_kind") or "",
                                 now_str() if initial == STEP_WAITING else None,
                                 step_spec.get("notify_until") or "18:00",
+                                step_spec.get("checklist_active_from") or "",
+                                step_spec.get("escalation_active_from") or "",
+                                1 if step_spec.get("notify_weekends") else 0,
                             ),
                         )
                         step_id = step_cursor.lastrowid
@@ -819,6 +873,7 @@ class ReminderDatabase:
                     step_data["notify_label"] = format_notify_label(
                         step_data["escalation"],
                         step_data["notify_until"],
+                        bool(step_data.get("notify_weekends")),
                     )
                     live = self._live_reminder_for_step(step["id"])
                     step_data["next_due"] = live["due_time"] if live else None
@@ -838,80 +893,131 @@ class ReminderDatabase:
         return self.get_step(reminder["step_id"])
 
     def get_step_escalation(self, step_id):
-        """Правила шага в виде, удобном для диалога правки."""
-        rules = self._escalation_rules(step_id)
-        if not rules:
-            return None
-        settings = {
-            "first_hours": 2,
-            "repeat_time": "09:00",
-            "frequent_hours": 3,
-            "notify_until": "18:00",
-        }
+        """Правила шага в виде списка шагов эскалации."""
         step = self.get_step(step_id)
-        if step:
-            settings["notify_until"] = step.get("notify_until") or "18:00"
+        rules = self._escalation_rules(step_id)
+        items = []
         for rule in rules:
-            if rule["interval_type"] == ESC_FIRST:
-                settings["first_hours"] = max(1, int(rule["delay_minutes"] or 120) // 60)
-            elif rule["interval_type"] == ESC_REPEAT:
-                settings["repeat_time"] = rule.get("fixed_time") or "09:00"
-            elif rule["interval_type"] == ESC_FREQUENT:
-                settings["frequent_hours"] = max(1, int(rule["delay_minutes"] or 180) // 60)
-        return settings
+            if rule["interval_type"] == ESC_REPEAT or rule.get("fixed_time"):
+                items.append(
+                    {
+                        "kind": "at",
+                        "minutes": 0,
+                        "time": rule.get("fixed_time") or "09:00",
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "kind": "after",
+                        "minutes": int(rule.get("delay_minutes") or 0),
+                        "time": "",
+                    }
+                )
+        return {
+            "steps": items,
+            "notify_until": (step or {}).get("notify_until") or "18:00",
+            "notify_weekends": bool((step or {}).get("notify_weekends")),
+            "active_from": (step or {}).get("escalation_active_from") or "",
+        }
+
+    def set_step_escalation(
+        self, step_id, steps, notify_until="18:00", notify_weekends=False, active_from=""
+    ):
+        """Полностью заменяет шаги эскалации одной транзакцией."""
+        try:
+            until_hour, until_minute = parse_hhmm(notify_until)
+        except (TypeError, ValueError, IndexError) as error:
+            raise ValueError("Время в формате ЧЧ:ММ.") from error
+        if (until_hour, until_minute) <= (WORK_START_HOUR, 0):
+            raise ValueError("Граница «уведомлять до» должна быть позже 09:00.")
+        until_stamp = format_hhmm(until_hour, until_minute)
+        start_date = ""
+        if (active_from or "").strip():
+            parsed = parse_dt(active_from)
+            if parsed is None:
+                raise ValueError("Дата «действует с» должна быть в формате ГГГГ-ММ-ДД.")
+            start_date = parsed.date().strftime(DATE_FORMAT)
+
+        prepared = []
+        for index, item in enumerate(steps or ()):
+            kind = item.get("kind") or "after"
+            if kind == "at":
+                try:
+                    hour, minute = parse_hhmm(item.get("time") or "09:00")
+                except (TypeError, ValueError, IndexError) as error:
+                    raise ValueError("Время шага «В» в формате ЧЧ:ММ.") from error
+                if (hour, minute) < (WORK_START_HOUR, 0) or (hour, minute) > (
+                    until_hour,
+                    until_minute,
+                ):
+                    raise ValueError("Время «В» должно быть в пределах 09:00 и «уведомлять до».")
+                prepared.append((ESC_REPEAT, 0, format_hhmm(hour, minute)))
+                continue
+            minutes = int(item.get("minutes") or 0)
+            if not 1 <= minutes <= 7 * 24 * 60:
+                raise ValueError("Интервал «Через»: от 1 минуты до 7 суток.")
+            interval = ESC_FIRST if index == 0 else ESC_FREQUENT
+            prepared.append((interval, minutes, ""))
+
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE steps
+                SET notify_until = ?, notify_weekends = ?, escalation_active_from = ?,
+                    escalation_index = MIN(escalation_index, ?)
+                WHERE id = ?
+                """,
+                (
+                    until_stamp,
+                    1 if notify_weekends else 0,
+                    start_date,
+                    max(len(prepared) - 1, 0),
+                    step_id,
+                ),
+            )
+            self._conn.execute("DELETE FROM escalation_rules WHERE step_id = ?", (step_id,))
+            for interval_type, minutes, stamp in prepared:
+                self._conn.execute(
+                    """
+                    INSERT INTO escalation_rules
+                        (step_id, interval_type, delay_minutes, fixed_time, is_active)
+                    VALUES (?, ?, ?, ?, 1)
+                    """,
+                    (step_id, interval_type, minutes, stamp),
+                )
+            if not prepared:
+                self._conn.execute(
+                    """
+                    UPDATE reminders
+                    SET status = ?, completed_at = NULL
+                    WHERE step_id = ? AND status = ?
+                    """,
+                    (STATUS_CANCELLED, step_id, STATUS_PENDING),
+                )
+            self._conn.commit()
+
+        step = self.get_step(step_id)
+        if prepared and step and step["status"] == STEP_WAITING:
+            self.schedule_step_reminder(step_id, advance=False)
+        return True
 
     def update_step_escalation(
         self, step_id, first_minutes, repeat_time, frequent_minutes, notify_until="18:00"
     ):
-        """Обновляет три правила эскалации шага и пересчитывает ближайшее due."""
-        first_minutes = int(first_minutes)
-        frequent_minutes = int(frequent_minutes)
-        if not 60 <= first_minutes <= 48 * 60:
-            raise ValueError("Первое напоминание: от 1 до 48 часов.")
-        if not 60 <= frequent_minutes <= 12 * 60:
-            raise ValueError("Повтор: от 1 до 12 часов.")
-        try:
-            hour, minute = parse_hhmm(repeat_time)
-            until_hour, until_minute = parse_hhmm(notify_until)
-        except (TypeError, ValueError, IndexError):
-            raise ValueError("Время в формате ЧЧ:ММ.")
-        if (until_hour, until_minute) <= (WORK_START_HOUR, 0):
-            raise ValueError("Граница «уведомлять до» должна быть позже 09:00.")
-        if (hour, minute) < (WORK_START_HOUR, 0) or (hour, minute) > (until_hour, until_minute):
-            raise ValueError("Время повтора должно быть в пределах 09:00 и «уведомлять до».")
-        stamp = format_hhmm(hour, minute)
-        until_stamp = format_hhmm(until_hour, until_minute)
-        rules = self._escalation_rules(step_id)
-        if not rules:
-            raise ValueError("У этого шага нет расписания уведомлений.")
-
-        with self._lock:
-            self._conn.execute(
-                "UPDATE steps SET notify_until = ? WHERE id = ?",
-                (until_stamp, step_id),
-            )
-            for rule in rules:
-                if rule["interval_type"] == ESC_FIRST:
-                    self._conn.execute(
-                        "UPDATE escalation_rules SET delay_minutes = ?, fixed_time = '' WHERE id = ?",
-                        (first_minutes, rule["id"]),
-                    )
-                elif rule["interval_type"] == ESC_REPEAT:
-                    self._conn.execute(
-                        "UPDATE escalation_rules SET delay_minutes = 0, fixed_time = ? WHERE id = ?",
-                        (stamp, rule["id"]),
-                    )
-                elif rule["interval_type"] == ESC_FREQUENT:
-                    self._conn.execute(
-                        "UPDATE escalation_rules SET delay_minutes = ?, fixed_time = '' WHERE id = ?",
-                        (frequent_minutes, rule["id"]),
-                    )
-            self._conn.commit()
-
+        """Совместимость: три фиксированных правила через set_step_escalation."""
         step = self.get_step(step_id)
-        if step and step["status"] == STEP_WAITING:
-            self.schedule_step_reminder(step_id, advance=False)
-        return True
+        return self.set_step_escalation(
+            step_id,
+            [
+                {"kind": "after", "minutes": int(first_minutes), "time": ""},
+                {"kind": "at", "minutes": 0, "time": repeat_time},
+                {"kind": "after", "minutes": int(frequent_minutes), "time": ""},
+            ],
+            notify_until,
+            bool((step or {}).get("notify_weekends")),
+            (step or {}).get("escalation_active_from") or "",
+        )
 
     def get_checklist_items(self, step_id):
         with self._lock:
@@ -952,6 +1058,11 @@ class ReminderDatabase:
         if missing:
             titles = ", ".join(f"«{title}»" for title in missing)
             raise StepDependencyError(f"Сначала завершите {titles}.")
+        active_from = property_active_from_date(step.get("checklist_active_from"))
+        if active_from and active_from > date.today():
+            raise StepDependencyError(
+                f"Чек-лист действует с {active_from.strftime('%d.%m.%Y')}"
+            )
 
         with self._lock:
             self._conn.execute(
@@ -1147,6 +1258,11 @@ class ReminderDatabase:
                 f"Нельзя закрыть шаг: сначала завершите {titles}."
             )
         if step["completion_type"] == COMPLETION_CHECKLIST:
+            active_from = property_active_from_date(step.get("checklist_active_from"))
+            if active_from and active_from > date.today():
+                raise StepDependencyError(
+                    f"Чек-лист действует с {active_from.strftime('%d.%m.%Y')}"
+                )
             items = self.get_checklist_items(step["id"])
             if items and not all(item["is_checked"] for item in items):
                 raise StepDependencyError(
@@ -1196,26 +1312,46 @@ class ReminderDatabase:
     def _compute_next_due(self, step):
         rules = self._escalation_rules(step["id"])
         until_hour, until_minute = parse_notify_until(step.get("notify_until"))
+        allow_weekends = bool(step.get("notify_weekends"))
         if not rules:
-            return clamp_to_work_hours(
-                datetime.now() + timedelta(hours=2), until_hour, until_minute
+            due = clamp_to_work_hours(
+                datetime.now() + timedelta(hours=2),
+                until_hour,
+                until_minute,
+                allow_weekends=allow_weekends,
             )
-        index = min(max(step.get("escalation_index") or 0, 0), len(rules) - 1)
-        rule = rules[index]
-        now = datetime.now()
-        if rule["interval_type"] == ESC_REPEAT or rule["fixed_time"]:
-            hour, minute = parse_hhmm(rule.get("fixed_time") or "09:00")
-            if (hour, minute) < (WORK_START_HOUR, 0):
-                hour, minute = WORK_START_HOUR, 0
-            if (hour, minute) > (until_hour, until_minute):
-                hour, minute = until_hour, until_minute
-            return next_workday_morning(now, hour, minute)
-        minutes = int(rule["delay_minutes"] or 0) or (
-            180 if rule["interval_type"] == ESC_FREQUENT else 120
-        )
-        return clamp_to_work_hours(
-            now + timedelta(minutes=minutes), until_hour, until_minute
-        )
+        else:
+            index = min(max(step.get("escalation_index") or 0, 0), len(rules) - 1)
+            rule = rules[index]
+            now = datetime.now()
+            if rule["interval_type"] == ESC_REPEAT or rule["fixed_time"]:
+                hour, minute = parse_hhmm(rule.get("fixed_time") or "09:00")
+                if (hour, minute) < (WORK_START_HOUR, 0):
+                    hour, minute = WORK_START_HOUR, 0
+                if (hour, minute) > (until_hour, until_minute):
+                    hour, minute = until_hour, until_minute
+                due = next_workday_morning(
+                    now, hour, minute, allow_weekends=allow_weekends
+                )
+            else:
+                minutes = int(rule["delay_minutes"] or 0) or (
+                    180 if rule["interval_type"] == ESC_FREQUENT else 120
+                )
+                due = clamp_to_work_hours(
+                    now + timedelta(minutes=minutes),
+                    until_hour,
+                    until_minute,
+                    allow_weekends=allow_weekends,
+                )
+        active_from = property_active_from_date(step.get("escalation_active_from"))
+        if active_from:
+            floor = datetime.combine(active_from, time(WORK_START_HOUR, 0))
+            if due < floor:
+                due = floor
+            due = clamp_to_work_hours(
+                due, until_hour, until_minute, allow_weekends=allow_weekends
+            )
+        return due
 
     def _escalation_rules(self, step_id):
         with self._lock:

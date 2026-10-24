@@ -290,6 +290,27 @@ body,
   width: 100%;
 }
 
+.step-title-input {
+  width: calc(100% - 8px);
+  margin: 4px;
+  border: 1px solid #8aa4c8;
+  border-radius: 4px;
+  font: inherit;
+  padding: 2px 6px;
+}
+
+.date-row,
+.escalation-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.escalation-row {
+  margin: 6px 0;
+}
+
 .tip-bubble {
   position: fixed;
   z-index: 80;

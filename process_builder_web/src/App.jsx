@@ -51,16 +51,50 @@ const CONNECTION_LINE_TYPES = {
   straight: ConnectionLineType.Straight,
 };
 
+function rulesToEscalationSteps(rules, defaults) {
+  if (Array.isArray(rules) && rules.length) {
+    return rules.map((rule) => {
+      if (rule.interval_type === "повторное" || rule.fixed_time) {
+        return { kind: "at", minutes: 0, time: rule.fixed_time || defaults.repeat_time || "09:00" };
+      }
+      return { kind: "after", minutes: Number(rule.delay_minutes) || 120, time: "" };
+    });
+  }
+  return (defaults.default_escalation || []).map((rule) => {
+    if (rule.interval_type === "повторное" || rule.fixed_time) {
+      return { kind: "at", minutes: 0, time: rule.fixed_time || "09:00" };
+    }
+    return { kind: "after", minutes: Number(rule.delay_minutes) || 120, time: "" };
+  });
+}
+
+function escalationStepsToRules(steps) {
+  return (steps || []).map((item, index) => {
+    if (item.kind === "at") {
+      return { interval_type: "повторное", delay_minutes: 0, fixed_time: item.time || "09:00" };
+    }
+    return {
+      interval_type: index === 0 ? "первое" : "частое",
+      delay_minutes: Number(item.minutes) || 180,
+      fixed_time: "",
+    };
+  });
+}
+
 function emptyStepData(defaults, title = "Новый шаг") {
   return {
     title,
     completion: defaults.completion_manual,
     checklistText: "",
     escalate: false,
+    escalationSteps: [],
     firstHours: 2,
     repeatTime: defaults.repeat_time,
     frequentHours: 3,
     notifyUntil: defaults.notify_until,
+    notifyWeekends: false,
+    checklistActiveFrom: "",
+    escalationActiveFrom: "",
   };
 }
 
@@ -151,7 +185,52 @@ function BranchNode({ data, selected }) {
   );
 }
 
+const RenameContext = createContext(null);
+
 function StepNode({ data, selected }) {
+  const rename = useContext(RenameContext);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(data.title || data.label || "Шаг");
+  const press = useRef(null);
+
+  useEffect(() => {
+    if (!editing) {
+      setDraft(data.title || data.label || "Шаг");
+    }
+  }, [data.title, data.label, editing]);
+
+  const commit = () => {
+    const next = (draft || "").trim();
+    setEditing(false);
+    const apply = data.onRename || rename;
+    if (!next || !apply) {
+      setDraft(data.title || data.label || "Шаг");
+      return;
+    }
+    apply(next);
+  };
+
+  const onPointerDown = (event) => {
+    if (data.locked) {
+      return;
+    }
+    press.current = { x: event.clientX, y: event.clientY };
+  };
+
+  const onPointerUp = (event) => {
+    if (data.locked || !press.current) {
+      return;
+    }
+    const dx = event.clientX - press.current.x;
+    const dy = event.clientY - press.current.y;
+    press.current = null;
+    if (Math.hypot(dx, dy) < 4) {
+      event.stopPropagation();
+      setDraft(data.title || data.label || "Шаг");
+      setEditing(true);
+    }
+  };
+
   return (
     <div className="step-node">
       <NodeResizer
@@ -163,7 +242,35 @@ function StepNode({ data, selected }) {
       />
       <Handle type="target" id="in" position={Position.Top} />
       <Handle type="target" id="in-left" position={Position.Left} />
-      <div className="step-title">{data.title || data.label || "Шаг"}</div>
+      {editing ? (
+        <input
+          className="step-title-input nodrag nopan"
+          value={draft}
+          autoFocus
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commit();
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setDraft(data.title || data.label || "Шаг");
+              setEditing(false);
+            }
+          }}
+        />
+      ) : (
+        <div
+          className="step-title"
+          title="Щёлкните, чтобы переименовать"
+          onPointerDown={onPointerDown}
+          onPointerUp={onPointerUp}
+        >
+          {data.title || data.label || "Шаг"}
+        </div>
+      )}
       <Handle type="source" id="out" position={Position.Bottom} />
       <Handle type="source" id="out-right" position={Position.Right} />
     </div>
@@ -222,10 +329,14 @@ function specToFlow(spec) {
           completion: step.completion_type || FALLBACK_DEFAULTS.completion_manual,
           checklistText: (step.checklist || []).join("\n"),
           escalate: Boolean((step.escalation || []).length),
+          escalationSteps: rulesToEscalationSteps(step.escalation || [], FALLBACK_DEFAULTS),
           firstHours: Math.max(1, Math.round((first?.delay_minutes || 120) / 60)),
           repeatTime: repeat?.fixed_time || "09:00",
           frequentHours: Math.max(1, Math.round((frequent?.delay_minutes || 180) / 60)),
           notifyUntil: step.notify_until || "18:00",
+          notifyWeekends: Boolean(step.notify_weekends),
+          checklistActiveFrom: step.checklist_active_from || "",
+          escalationActiveFrom: step.escalation_active_from || "",
         })
       );
     });
@@ -289,24 +400,34 @@ function flowToSpec(nodes, edges, name, defaults, defaultEdgeType) {
             depends_on: incoming,
             checklist,
             notify_until: node.data?.notifyUntil || defaults.notify_until,
+            notify_weekends: Boolean(node.data?.notifyWeekends),
+            checklist_active_from: node.data?.checklistActiveFrom || "",
+            escalation_active_from: node.data?.escalationActiveFrom || "",
             escalation: escalate
-              ? [
-                  {
-                    interval_type: "первое",
-                    delay_minutes: Number(node.data.firstHours || 2) * 60,
-                    fixed_time: "",
-                  },
-                  {
-                    interval_type: "повторное",
-                    delay_minutes: 0,
-                    fixed_time: node.data.repeatTime || defaults.repeat_time,
-                  },
-                  {
-                    interval_type: "частое",
-                    delay_minutes: Number(node.data.frequentHours || 3) * 60,
-                    fixed_time: "",
-                  },
-                ]
+              ? escalationStepsToRules(
+                  node.data?.escalationSteps?.length
+                    ? node.data.escalationSteps
+                    : rulesToEscalationSteps(
+                        [
+                          {
+                            interval_type: "первое",
+                            delay_minutes: Number(node.data.firstHours || 2) * 60,
+                            fixed_time: "",
+                          },
+                          {
+                            interval_type: "повторное",
+                            delay_minutes: 0,
+                            fixed_time: node.data.repeatTime || defaults.repeat_time,
+                          },
+                          {
+                            interval_type: "частое",
+                            delay_minutes: Number(node.data.frequentHours || 3) * 60,
+                            fixed_time: "",
+                          },
+                        ],
+                        defaults
+                      )
+                )
               : [],
           };
         });
@@ -541,9 +662,25 @@ export default function App() {
     () =>
       nodes.map((node) => ({
         ...node,
-        data: { ...node.data, locked: readonly },
+        data: {
+          ...node.data,
+          locked: readonly,
+          onRename:
+            readonly || node.type !== "step"
+              ? undefined
+              : (title) => {
+                  setNodes((current) =>
+                    current.map((item) =>
+                      item.id === node.id
+                        ? { ...item, data: { ...item.data, title } }
+                        : item
+                    )
+                  );
+                  setDirty(true);
+                },
+        },
       })),
-    [nodes, readonly]
+    [nodes, readonly, setNodes]
   );
 
   const markDirty = useCallback(() => {
@@ -823,9 +960,15 @@ export default function App() {
     if (!selected || readonly) {
       return;
     }
+    const extra = {};
+    if (patch.escalate && !(selected.data?.escalationSteps || []).length) {
+      extra.escalationSteps = rulesToEscalationSteps(defaults.default_escalation, defaults);
+    }
     setNodes((current) =>
       current.map((node) =>
-        node.id === selected.id ? { ...node, data: { ...node.data, ...patch } } : node
+        node.id === selected.id
+          ? { ...node, data: { ...node.data, ...patch, ...extra } }
+          : node
       )
     );
     setDirty(true);
@@ -1424,17 +1567,39 @@ export default function App() {
                 </select>
               </Tip>
               {selected.data?.completion === defaults.completion_checklist && (
-                <Tip text="Каждый пункт с новой строки. Шаг закроется, когда отмечены все.">
-                  <label>Пункты чек-листа (по одному в строке)</label>
-                  <textarea
-                    rows={5}
-                    value={selected.data?.checklistText || ""}
-                    disabled={readonly}
-                    onChange={(event) => patchSelected({ checklistText: event.target.value })}
-                  />
-                </Tip>
+                <>
+                  <Tip text="Каждый пункт с новой строки. Шаг закроется, когда отмечены все.">
+                    <label>Пункты чек-листа (по одному в строке)</label>
+                    <textarea
+                      rows={5}
+                      value={selected.data?.checklistText || ""}
+                      disabled={readonly}
+                      onChange={(event) => patchSelected({ checklistText: event.target.value })}
+                    />
+                  </Tip>
+                  <Tip text="Пусто — чек-лист действует сразу.">
+                    <label>Действует с</label>
+                    <div className="date-row">
+                      <input
+                        type="date"
+                        value={selected.data?.checklistActiveFrom || ""}
+                        disabled={readonly}
+                        onChange={(event) =>
+                          patchSelected({ checklistActiveFrom: event.target.value })
+                        }
+                      />
+                      <button
+                        type="button"
+                        disabled={readonly}
+                        onClick={() => patchSelected({ checklistActiveFrom: "" })}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </Tip>
+                </>
               )}
-              <Tip text="Напоминать, пока шаг не выполнен: первое, повтор утром и дальше через интервал.">
+              <Tip text="Напоминать, пока шаг не выполнен. Шаги эскалации идут по очереди.">
                 <label>
                   <input
                     type="checkbox"
@@ -1447,43 +1612,155 @@ export default function App() {
               </Tip>
               {selected.data?.escalate && (
                 <>
-                  <Tip text="Через сколько часов придёт первое напоминание.">
-                    <label>Первое через, часов</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="48"
-                      value={selected.data?.firstHours || 2}
-                      disabled={readonly}
-                      onChange={(event) => patchSelected({ firstHours: event.target.value })}
-                    />
-                  </Tip>
-                  <Tip text="Во сколько на следующий рабочий день придёт повтор.">
-                    <label>Повтор (ЧЧ:ММ)</label>
-                    <input
-                      value={selected.data?.repeatTime || "09:00"}
-                      disabled={readonly}
-                      onChange={(event) => patchSelected({ repeatTime: event.target.value })}
-                    />
-                  </Tip>
-                  <Tip text="Как часто напоминать после повтора.">
-                    <label>Дальше каждые, часов</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="12"
-                      value={selected.data?.frequentHours || 3}
-                      disabled={readonly}
-                      onChange={(event) => patchSelected({ frequentHours: event.target.value })}
-                    />
-                  </Tip>
-                  <Tip text="После этого времени напоминания переносятся на следующий рабочий день.">
+                  {(selected.data?.escalationSteps || []).map((item, index) => (
+                    <div key={`esc-${index}`} className="escalation-row">
+                      <span>Шаг {index + 1}</span>
+                      <select
+                        value={item.kind}
+                        disabled={readonly}
+                        onChange={(event) => {
+                          const next = [...(selected.data.escalationSteps || [])];
+                          next[index] = { ...item, kind: event.target.value };
+                          patchSelected({ escalationSteps: next });
+                        }}
+                      >
+                        <option value="after">Через</option>
+                        <option value="at">В время</option>
+                      </select>
+                      {item.kind === "at" ? (
+                        <input
+                          value={item.time || "09:00"}
+                          disabled={readonly}
+                          onChange={(event) => {
+                            const next = [...(selected.data.escalationSteps || [])];
+                            next[index] = { ...item, time: event.target.value };
+                            patchSelected({ escalationSteps: next });
+                          }}
+                        />
+                      ) : (
+                        <>
+                          <input
+                            type="number"
+                            min="0"
+                            max="168"
+                            value={Math.floor((item.minutes || 180) / 60)}
+                            disabled={readonly}
+                            onChange={(event) => {
+                              const next = [...(selected.data.escalationSteps || [])];
+                              const mins = (item.minutes || 0) % 60;
+                              next[index] = {
+                                ...item,
+                                minutes: Number(event.target.value || 0) * 60 + mins,
+                              };
+                              patchSelected({ escalationSteps: next });
+                            }}
+                          />
+                          <span>ч</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max="59"
+                            value={(item.minutes || 0) % 60}
+                            disabled={readonly}
+                            onChange={(event) => {
+                              const next = [...(selected.data.escalationSteps || [])];
+                              const hours = Math.floor((item.minutes || 0) / 60);
+                              next[index] = {
+                                ...item,
+                                minutes: hours * 60 + Number(event.target.value || 0),
+                              };
+                              patchSelected({ escalationSteps: next });
+                            }}
+                          />
+                          <span>мин</span>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        disabled={readonly || index === 0}
+                        onClick={() => {
+                          const next = [...(selected.data.escalationSteps || [])];
+                          [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                          patchSelected({ escalationSteps: next });
+                        }}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        disabled={readonly || index === (selected.data.escalationSteps || []).length - 1}
+                        onClick={() => {
+                          const next = [...(selected.data.escalationSteps || [])];
+                          [next[index + 1], next[index]] = [next[index], next[index + 1]];
+                          patchSelected({ escalationSteps: next });
+                        }}
+                      >
+                        ↓
+                      </button>
+                      <button
+                        type="button"
+                        disabled={readonly}
+                        onClick={() => {
+                          const next = (selected.data.escalationSteps || []).filter((_, i) => i !== index);
+                          patchSelected({ escalationSteps: next });
+                        }}
+                      >
+                        Удалить
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    disabled={readonly}
+                    onClick={() =>
+                      patchSelected({
+                        escalationSteps: [
+                          ...(selected.data.escalationSteps || []),
+                          { kind: "after", minutes: 180, time: "" },
+                        ],
+                      })
+                    }
+                  >
+                    Добавить шаг эскалации
+                  </button>
+                  <Tip text="После этого времени напоминания переносятся на следующий день.">
                     <label>Уведомлять до</label>
                     <input
                       value={selected.data?.notifyUntil || "18:00"}
                       disabled={readonly}
                       onChange={(event) => patchSelected({ notifyUntil: event.target.value })}
                     />
+                  </Tip>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selected.data?.notifyWeekends)}
+                      disabled={readonly}
+                      onChange={(event) =>
+                        patchSelected({ notifyWeekends: event.target.checked })
+                      }
+                    />{" "}
+                    Уведомлять в выходные
+                  </label>
+                  <Tip text="Пусто — эскалация действует сразу.">
+                    <label>Действует с</label>
+                    <div className="date-row">
+                      <input
+                        type="date"
+                        value={selected.data?.escalationActiveFrom || ""}
+                        disabled={readonly}
+                        onChange={(event) =>
+                          patchSelected({ escalationActiveFrom: event.target.value })
+                        }
+                      />
+                      <button
+                        type="button"
+                        disabled={readonly}
+                        onClick={() => patchSelected({ escalationActiveFrom: "" })}
+                      >
+                        ×
+                      </button>
+                    </div>
                   </Tip>
                 </>
               )}

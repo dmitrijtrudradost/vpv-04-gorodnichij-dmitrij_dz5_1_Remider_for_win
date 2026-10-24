@@ -382,8 +382,9 @@ class NotificationManager:
             ttk.Button(buttons, text="Отложить", command=show_snooze).pack(
                 side="left", padx=(0, 6)
             )
-            ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
-            popup.protocol("WM_DELETE_WINDOW", close_popup)
+            close_cmd = postpone_wait if step else close_popup
+            ttk.Button(buttons, text="Закрыть", command=close_cmd).pack(side="left")
+            popup.protocol("WM_DELETE_WINDOW", close_cmd)
         else:
             ttk.Button(buttons, text="Закрыть", command=close_popup).pack(side="left")
             popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -508,13 +509,25 @@ class NotificationManager:
             foreground="#666666",
         ).pack(anchor="w", pady=(0, 8))
 
+        active_from = db_module.property_active_from_date(step.get("checklist_active_from"))
+        locked = bool(active_from and active_from > date.today())
+        if locked:
+            ttk.Label(
+                dialog,
+                text=f"Чек-лист действует с {active_from.strftime('%d.%m.%Y')}",
+                foreground="#b02020",
+            ).pack(anchor="w", pady=(0, 8))
+
         vars_by_id = {}
         for item in items:
             var = tk.BooleanVar(value=bool(item["is_checked"]))
             vars_by_id[item["id"]] = var
-            ttk.Checkbutton(dialog, text=item["text"], variable=var).pack(
-                anchor="w", pady=2
-            )
+            ttk.Checkbutton(
+                dialog,
+                text=item["text"],
+                variable=var,
+                state="disabled" if locked else "normal",
+            ).pack(anchor="w", pady=2)
 
         def save_and_maybe_close():
             try:

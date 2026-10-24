@@ -32,7 +32,7 @@ from templates import (
 )
 import autostart
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 FILTER_ALL = "Все"
 QUICK_MINUTES = (1, 5, 15, 30, 45, 60)
@@ -251,6 +251,77 @@ def _quick_label(minutes):
     return f"+{minutes} мин"
 
 
+def attach_datetime_fields(parent, row=1):
+    """Календарь, часы:минуты:секунды и быстрые кнопки. Возвращает чтение datetime."""
+    ttk.Label(parent, text="Дата и время:").grid(row=row, column=0, sticky="nw", pady=4)
+    box = ttk.Frame(parent)
+    box.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=4)
+    time_row = ttk.Frame(box)
+    time_row.pack(anchor="w")
+    date_entry = PersistentDateEntry(
+        time_row,
+        width=12,
+        locale="ru_RU",
+        date_pattern="yyyy-mm-dd",
+        mindate=date.today(),
+        font=("Segoe UI", 9),
+    )
+    date_entry.pack(side="left")
+    ttk.Label(time_row, text="в").pack(side="left", padx=8)
+    hour_var = tk.StringVar()
+    minute_var = tk.StringVar()
+    second_var = tk.StringVar()
+
+    def apply_offset(minutes):
+        target = datetime.now() + timedelta(minutes=minutes)
+        date_entry.set_date(target.date())
+        hour_var.set(f"{target.hour:02d}")
+        minute_var.set(f"{target.minute:02d}")
+        second_var.set(f"{target.second:02d}")
+
+    apply_offset(SNOOZE_MINUTES)
+    for index, (variable, (_name, limit)) in enumerate(
+        zip((hour_var, minute_var, second_var), TIME_FIELDS)
+    ):
+        if index:
+            ttk.Label(time_row, text=":").pack(side="left")
+        ttk.Spinbox(
+            time_row,
+            from_=0,
+            to=limit,
+            textvariable=variable,
+            width=3,
+            wrap=True,
+            format="%02.0f",
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+    quick = ttk.Frame(box)
+    quick.pack(anchor="w", pady=(6, 0))
+    for minutes in (45, 60):
+        ttk.Button(
+            quick,
+            text=_quick_label(minutes),
+            width=8,
+            command=lambda value=minutes: apply_offset(value),
+        ).pack(side="left", padx=(0, 4))
+
+    def read_due():
+        parts = []
+        for variable, (name, limit) in zip(
+            (hour_var, minute_var, second_var), TIME_FIELDS
+        ):
+            raw = variable.get().strip()
+            if not raw.isdigit():
+                raise ValueError(f"Поле «{name}» должно содержать число.")
+            value = int(raw)
+            if value > limit:
+                raise ValueError(f"Поле «{name}» не может быть больше {limit}.")
+            parts.append(value)
+        return datetime.combine(date_entry.get_date(), time(*parts))
+
+    return read_due
+
+
 def open_snooze_dialog(parent, db, reminder_id, on_done=None):
     """Диалог: +5 минут или произвольная дата/время."""
     reminder = db.get_reminder_by_id(reminder_id)
@@ -279,58 +350,7 @@ def open_snooze_dialog(parent, db, reminder_id, on_done=None):
         wraplength=360,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-    ttk.Label(frame, text="Дата и время:").grid(row=1, column=0, sticky="w", pady=4)
-    time_row = ttk.Frame(frame)
-    time_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=4)
-
-    date_entry = PersistentDateEntry(
-        time_row,
-        width=12,
-        locale="ru_RU",
-        date_pattern="yyyy-mm-dd",
-        mindate=date.today(),
-        font=("Segoe UI", 9),
-    )
-    date_entry.pack(side="left")
-    ttk.Label(time_row, text="в").pack(side="left", padx=8)
-
-    hour_var = tk.StringVar()
-    minute_var = tk.StringVar()
-    second_var = tk.StringVar()
-    target = datetime.now() + timedelta(minutes=SNOOZE_MINUTES)
-    date_entry.set_date(target.date())
-    hour_var.set(f"{target.hour:02d}")
-    minute_var.set(f"{target.minute:02d}")
-    second_var.set(f"{target.second:02d}")
-    for index, (variable, (_name, limit)) in enumerate(
-        zip((hour_var, minute_var, second_var), TIME_FIELDS)
-    ):
-        if index:
-            ttk.Label(time_row, text=":").pack(side="left")
-        ttk.Spinbox(
-            time_row,
-            from_=0,
-            to=limit,
-            textvariable=variable,
-            width=3,
-            wrap=True,
-            format="%02.0f",
-            font=("Segoe UI", 9),
-        ).pack(side="left")
-
-    def read_due():
-        parts = []
-        for variable, (name, limit) in zip(
-            (hour_var, minute_var, second_var), TIME_FIELDS
-        ):
-            raw = variable.get().strip()
-            if not raw.isdigit():
-                raise ValueError(f"Поле «{name}» должно содержать число.")
-            value = int(raw)
-            if value > limit:
-                raise ValueError(f"Поле «{name}» не может быть больше {limit}.")
-            parts.append(value)
-        return datetime.combine(date_entry.get_date(), time(*parts))
+    read_due = attach_datetime_fields(frame, row=1)
 
     def save():
         try:
@@ -361,6 +381,45 @@ def open_snooze_dialog(parent, db, reminder_id, on_done=None):
     ttk.Button(buttons, text="Отложить", command=save).pack(side="right", padx=2)
     ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right", padx=2)
 
+    win.grab_set()
+    win.wait_window()
+
+
+def open_resume_dialog(parent, db, reminder_ids, on_done=None):
+    """Ручное возобновление выбранных просроченных напоминаний."""
+    win = tk.Toplevel(parent)
+    win.title("Возобновить просроченные")
+    win.transient(parent)
+    win.resizable(False, False)
+    frame = ttk.Frame(win, padding=12)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(
+        frame,
+        text=f"Выбрано записей: {len(reminder_ids)}",
+        font=("Segoe UI", 9, "bold"),
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+    read_due = attach_datetime_fields(frame, row=1)
+
+    def save():
+        try:
+            resumed = db.resume_reminders(reminder_ids, read_due())
+        except ValueError as error:
+            messagebox.showerror("Не удалось возобновить", str(error), parent=win)
+            return
+        skipped = len(reminder_ids) - resumed
+        win.destroy()
+        if on_done:
+            on_done()
+        messagebox.showinfo(
+            "Возобновление",
+            f"Возобновлено: {resumed}, пропущено (не просрочены): {skipped}.",
+            parent=parent,
+        )
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=2, column=0, columnspan=3, sticky="e", pady=(14, 0))
+    ttk.Button(buttons, text="Возобновить", command=save).pack(side="right", padx=2)
+    ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right", padx=2)
     win.grab_set()
     win.wait_window()
 
@@ -533,6 +592,12 @@ class ReminderApp:
         )
         ttk.Button(toolbar, text="Отложить", command=self.snooze_selected_reminder).pack(
             side="right", padx=2
+        )
+        ttk.Button(toolbar, text="Возобновить", command=self.resume_selected_reminders).pack(
+            side="right", padx=2
+        )
+        ttk.Button(toolbar, text="Просроченные", command=self.filter_overdue).pack(
+            side="left", padx=2
         )
         self.selection_var = tk.StringVar(value="Выбрано: 0")
         ttk.Label(toolbar, textvariable=self.selection_var).pack(side="left", padx=(8, 0))
@@ -825,6 +890,11 @@ class ReminderApp:
                 )
                 for step in branch["steps"]:
                     detail = step.get("result_note") or step.get("completion_type")
+                    active_from = db_module.property_active_from_date(
+                        step.get("checklist_active_from")
+                    )
+                    if active_from and active_from > date.today():
+                        detail = f"чек-лист с {active_from.strftime('%d.%m.%Y')}"
                     if step["status"] == STEP_WAITING and step.get("next_due"):
                         detail = f"сработает {step['next_due']}"
                     if step["status"] == STEP_OVERDUE or step.get("stale"):
@@ -960,120 +1030,178 @@ class ReminderApp:
         if step_id is None:
             messagebox.showinfo("Ничего не выбрано", "Выберите шаг в дереве процесса.")
             return
-        settings = self.db.get_step_escalation(step_id)
-        if settings is None:
-            messagebox.showinfo(
-                "Нет уведомлений",
-                "У этого шага нет расписания уведомлений, править нечего.",
-            )
+        step = self.db.get_step(step_id)
+        if step and step.get("status") == STEP_DONE:
+            messagebox.showinfo("Шаг закрыт", "У выполненного шага расписание не меняется.")
             return
-        self._open_escalation_dialog(step_id, settings)
+        self._open_escalation_dialog(step_id, self.db.get_step_escalation(step_id))
 
     def _open_escalation_dialog(self, step_id, settings):
         step = self.db.get_step(step_id)
         win = tk.Toplevel(self.root)
         win.title("Расписание уведомлений")
         win.transient(self.root)
-        win.resizable(False, False)
         frame = ttk.Frame(win, padding=12)
         frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
 
         ttk.Label(
             frame,
             text=step["title"] if step else "Шаг",
             font=("Segoe UI", 9, "bold"),
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-
-        first_var = tk.StringVar(value=str(settings["first_hours"]))
-        ttk.Label(frame, text="Первое через, часов:").grid(
-            row=1, column=0, sticky="w", pady=4
-        )
-        ttk.Spinbox(
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(
             frame,
-            from_=1,
-            to=48,
-            textvariable=first_var,
-            width=6,
-            wrap=True,
-        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+            text="Каждый следующий шаг начинается после предыдущего. "
+            "Последний повторяется, пока шаг не выполнен.",
+            foreground="#777777",
+            wraplength=520,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-        hour, minute = db_module.parse_hhmm(settings["repeat_time"])
-        hour_var = tk.StringVar(value=f"{hour:02d}")
-        minute_var = tk.StringVar(value=f"{minute:02d}")
-        ttk.Label(frame, text="Повтор в следующий рабочий день в:").grid(
-            row=2, column=0, sticky="w", pady=4
-        )
-        time_row = ttk.Frame(frame)
-        time_row.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
-        ttk.Spinbox(
-            time_row, from_=9, to=23, textvariable=hour_var, width=3, wrap=True, format="%02.0f"
-        ).pack(side="left")
-        ttk.Label(time_row, text=":").pack(side="left")
-        ttk.Spinbox(
-            time_row, from_=0, to=59, textvariable=minute_var, width=3, wrap=True, format="%02.0f"
-        ).pack(side="left")
+        rows_frame = ttk.Frame(frame)
+        rows_frame.grid(row=2, column=0, sticky="ew")
+        row_vars = []
 
-        freq_var = tk.StringVar(value=str(settings["frequent_hours"]))
-        ttk.Label(frame, text="Дальше каждые, часов:").grid(
-            row=3, column=0, sticky="w", pady=4
+        def collect_steps():
+            items = []
+            for item in row_vars:
+                kind = item["kind"].get()
+                if kind in ("at", "В время"):
+                    items.append(
+                        {
+                            "kind": "at",
+                            "minutes": 0,
+                            "time": f"{int(item['hour'].get()):02d}:{int(item['minute'].get()):02d}",
+                        }
+                    )
+                else:
+                    hours = int(item["hours"].get() or 0)
+                    minutes = int(item["mins"].get() or 0)
+                    items.append({"kind": "after", "minutes": hours * 60 + minutes, "time": ""})
+            return items
+
+        def redraw_rows():
+            for child in rows_frame.winfo_children():
+                child.destroy()
+            snapshot = collect_steps() if row_vars else list(settings.get("steps") or [])
+            row_vars.clear()
+            if not snapshot:
+                ttk.Label(rows_frame, text="Шагов эскалации пока нет.", foreground="#777777").pack(
+                    anchor="w"
+                )
+                return
+            for index, spec in enumerate(snapshot):
+                add_row(index, spec)
+
+        def add_row(index, spec):
+            kind = spec.get("kind") or "after"
+            line = ttk.Frame(rows_frame)
+            line.pack(fill="x", pady=3)
+            ttk.Label(line, text=f"Шаг {index + 1}").pack(side="left")
+            kind_var = tk.StringVar(value="В время" if kind in ("at", "В время") else "Через")
+            hours_var = tk.StringVar(value=str((int(spec.get("minutes") or 180)) // 60))
+            mins_var = tk.StringVar(value=str((int(spec.get("minutes") or 0)) % 60))
+            try:
+                hour, minute = db_module.parse_hhmm(spec.get("time") or "09:00")
+            except ValueError:
+                hour, minute = 9, 0
+            hour_var = tk.StringVar(value=f"{hour:02d}")
+            minute_var = tk.StringVar(value=f"{minute:02d}")
+            ttk.Combobox(
+                line,
+                textvariable=kind_var,
+                values=("Через", "В время"),
+                width=10,
+                state="readonly",
+            ).pack(side="left", padx=6)
+            ttk.Spinbox(line, from_=0, to=168, textvariable=hours_var, width=4).pack(
+                side="left", padx=(8, 2)
+            )
+            ttk.Label(line, text="ч").pack(side="left")
+            ttk.Spinbox(line, from_=0, to=59, textvariable=mins_var, width=3).pack(
+                side="left", padx=(4, 2)
+            )
+            ttk.Label(line, text="мин /").pack(side="left")
+            ttk.Spinbox(
+                line, from_=0, to=23, textvariable=hour_var, width=3, format="%02.0f"
+            ).pack(side="left", padx=(4, 0))
+            ttk.Label(line, text=":").pack(side="left")
+            ttk.Spinbox(
+                line, from_=0, to=59, textvariable=minute_var, width=3, format="%02.0f"
+            ).pack(side="left")
+            row_vars.append(
+                {
+                    "kind": kind_var,
+                    "hours": hours_var,
+                    "mins": mins_var,
+                    "hour": hour_var,
+                    "minute": minute_var,
+                }
+            )
+
+            def move(delta, current=index):
+                items = collect_steps()
+                target = current + delta
+                if target < 0 or target >= len(items):
+                    return
+                items[current], items[target] = items[target], items[current]
+                settings["steps"] = items
+                redraw_rows()
+
+            def remove(current=index):
+                items = collect_steps()
+                items.pop(current)
+                settings["steps"] = items
+                redraw_rows()
+
+            ttk.Button(line, text="↑", width=3, command=lambda: move(-1)).pack(side="left", padx=2)
+            ttk.Button(line, text="↓", width=3, command=lambda: move(1)).pack(side="left")
+            ttk.Button(line, text="Удалить", command=remove).pack(side="left", padx=4)
+
+        def add_step_row():
+            items = collect_steps()
+            items.append({"kind": "after", "minutes": 180, "time": ""})
+            settings["steps"] = items
+            redraw_rows()
+
+        redraw_rows()
+        ttk.Button(frame, text="Добавить шаг эскалации", command=add_step_row).grid(
+            row=3, column=0, sticky="w", pady=(8, 10)
         )
-        ttk.Spinbox(
-            frame,
-            from_=1,
-            to=12,
-            textvariable=freq_var,
-            width=6,
-            wrap=True,
-        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=4)
 
         until_hour, until_minute = db_module.parse_notify_until(settings.get("notify_until"))
         until_hour_var = tk.StringVar(value=f"{until_hour:02d}")
         until_minute_var = tk.StringVar(value=f"{until_minute:02d}")
-        ttk.Label(frame, text="Уведомлять до:").grid(row=4, column=0, sticky="w", pady=4)
-        until_row = ttk.Frame(frame)
-        until_row.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=4)
-        ttk.Spinbox(
-            until_row,
-            from_=9,
-            to=23,
-            textvariable=until_hour_var,
-            width=3,
-            wrap=True,
-            format="%02.0f",
-        ).pack(side="left")
-        ttk.Label(until_row, text=":").pack(side="left")
-        ttk.Spinbox(
-            until_row,
-            from_=0,
-            to=59,
-            textvariable=until_minute_var,
-            width=3,
-            wrap=True,
-            format="%02.0f",
-        ).pack(side="left")
-        ttk.Label(
-            frame,
-            text="пн–пт, с 09:00 (по умолчанию до 18:00)",
-            foreground="#777777",
-        ).grid(row=4, column=2, sticky="w", padx=(8, 0))
+        weekends_var = tk.BooleanVar(value=bool(settings.get("notify_weekends")))
+        active_var = tk.StringVar(value=settings.get("active_from") or "")
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        extras = ttk.Frame(frame)
+        extras.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(extras, text="Уведомлять до:").pack(side="left")
+        ttk.Spinbox(
+            extras, from_=9, to=23, textvariable=until_hour_var, width=3, format="%02.0f"
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(extras, text=":").pack(side="left")
+        ttk.Spinbox(
+            extras, from_=0, to=59, textvariable=until_minute_var, width=3, format="%02.0f"
+        ).pack(side="left")
+        ttk.Checkbutton(extras, text="Уведомлять в выходные", variable=weekends_var).pack(
+            side="left", padx=(12, 0)
+        )
+        ttk.Label(extras, text="Действует с:").pack(side="left", padx=(12, 4))
+        ttk.Entry(extras, textvariable=active_var, width=12).pack(side="left")
 
         def save():
             try:
-                first_hours = int(first_var.get().strip())
-                frequent_hours = int(freq_var.get().strip())
-                stamp = f"{int(hour_var.get()):02d}:{int(minute_var.get()):02d}"
                 until_stamp = (
                     f"{int(until_hour_var.get()):02d}:{int(until_minute_var.get()):02d}"
                 )
-                self.db.update_step_escalation(
+                self.db.set_step_escalation(
                     step_id,
-                    first_hours * 60,
-                    stamp,
-                    frequent_hours * 60,
+                    collect_steps(),
                     until_stamp,
+                    weekends_var.get(),
+                    active_var.get().strip(),
                 )
             except ValueError as error:
                 messagebox.showerror("Не удалось сохранить", str(error), parent=win)
@@ -1082,9 +1210,10 @@ class ReminderApp:
             self.refresh_processes()
             self.refresh_reminders()
 
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Сохранить", command=save).pack(side="right", padx=2)
         ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right", padx=2)
-
         win.grab_set()
         win.wait_window()
 
@@ -1249,6 +1378,17 @@ class ReminderApp:
             messagebox.showinfo("Выберите одно напоминание", "Отложить можно только одну запись.")
             return
         self.open_snooze_for_reminder(ids[0])
+
+    def filter_overdue(self):
+        self.filter_var.set(STATUS_OVERDUE)
+        self.refresh_reminders()
+
+    def resume_selected_reminders(self):
+        ids = self._selected_ids()
+        if not ids:
+            messagebox.showinfo("Ничего не выбрано", "Выберите просроченные напоминания.")
+            return
+        open_resume_dialog(self.root, self.db, ids, on_done=self.refresh_reminders)
 
     def open_snooze_for_reminder(self, reminder_id, parent=None):
         open_snooze_dialog(
