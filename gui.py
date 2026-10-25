@@ -25,6 +25,8 @@ from database import (
 from notifications import NotificationManager
 from templates import (
     ACTION_CHECKLIST,
+    COMPLETION_MANUAL,
+    COMPLETION_WAIT,
     GUARD_FIELDS,
     TEMPLATE_EDO,
     TEMPLATE_GUARD,
@@ -39,6 +41,8 @@ QUICK_MINUTES = (1, 5, 15, 30, 45, 60)
 REFRESH_INTERVAL_MS = 2000
 PISTACHIO = "#93C572"
 PISTACHIO_ACTIVE = "#7eaf5f"
+PROCESS_BUILDER = "#5B8FC7"
+PROCESS_BUILDER_ACTIVE = "#4A7AAD"
 SNOOZE_MINUTES = 5
 
 TIME_FIELDS = (("часы", 23), ("минуты", 59), ("секунды", 59))
@@ -450,8 +454,8 @@ class ReminderApp:
 
     def setup_ui(self):
         self.root.title(f"Напоминалка {APP_VERSION}")
-        self.root.geometry("1100x680")
-        self.root.minsize(900, 560)
+        self.root.geometry("800x680")
+        self.root.minsize(800, 560)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         style = ttk.Style()
@@ -543,8 +547,10 @@ class ReminderApp:
                 command=lambda m=minutes: self.set_quick_time(m),
             ).pack(side="left", padx=2)
 
+        add_row = ttk.Frame(form)
+        add_row.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
         tk.Button(
-            form,
+            add_row,
             text="Добавить напоминание",
             command=self.add_reminder,
             bg=PISTACHIO,
@@ -553,7 +559,10 @@ class ReminderApp:
             padx=10,
             pady=4,
             font=("Segoe UI", 9),
-        ).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        ).pack(side="left")
+        ttk.Button(add_row, text="Тест уведомления", command=self.test_notification).pack(
+            side="left", padx=(8, 2)
+        )
 
         self.set_quick_time(5)
 
@@ -574,33 +583,23 @@ class ReminderApp:
         filter_box.pack(side="left", padx=(8, 16))
         filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_reminders())
 
-        ttk.Button(toolbar, text="Обновить", command=self.refresh_reminders).pack(
+        self.selection_var = tk.StringVar(value="Выбрано: 0")
+        ttk.Label(toolbar, textvariable=self.selection_var).pack(side="left", padx=(8, 12))
+        ttk.Button(toolbar, text="Возобновить", command=self.resume_selected_reminders).pack(
             side="left", padx=2
-        )
-        ttk.Button(toolbar, text="Тест уведомления", command=self.test_notification).pack(
-            side="left", padx=2
-        )
-
-        ttk.Button(toolbar, text="Удалить", command=self.delete_reminder).pack(
-            side="right", padx=2
-        )
-        ttk.Button(toolbar, text="Отменить", command=self.mark_as_cancelled).pack(
-            side="right", padx=2
-        )
-        ttk.Button(toolbar, text="Отметить готовым", command=self.mark_as_done).pack(
-            side="right", padx=2
         )
         ttk.Button(toolbar, text="Отложить", command=self.snooze_selected_reminder).pack(
-            side="right", padx=2
-        )
-        ttk.Button(toolbar, text="Возобновить", command=self.resume_selected_reminders).pack(
-            side="right", padx=2
-        )
-        ttk.Button(toolbar, text="Просроченные", command=self.filter_overdue).pack(
             side="left", padx=2
         )
-        self.selection_var = tk.StringVar(value="Выбрано: 0")
-        ttk.Label(toolbar, textvariable=self.selection_var).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Отметить готовым", command=self.mark_as_done).pack(
+            side="left", padx=2
+        )
+        ttk.Button(toolbar, text="Отменить", command=self.mark_as_cancelled).pack(
+            side="left", padx=2
+        )
+        ttk.Button(toolbar, text="Удалить", command=self.delete_reminder).pack(
+            side="left", padx=2
+        )
 
     def _build_list(self, parent):
         wrapper = ttk.Frame(parent)
@@ -632,6 +631,7 @@ class ReminderApp:
             self.tree.tag_configure(status, foreground=color)
 
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Delete>", lambda _e: self.delete_reminder())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_selection_label())
@@ -653,22 +653,32 @@ class ReminderApp:
 
         ttk.Label(form, text="Шаблон:").grid(row=0, column=0, sticky="w", pady=3)
         self.template_var = tk.StringVar(value=TEMPLATE_LABELS[TEMPLATE_EDO])
+        tpl_row = ttk.Frame(form)
+        tpl_row.grid(row=0, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=3)
         self.template_box = ttk.Combobox(
-            form,
+            tpl_row,
             textvariable=self.template_var,
             values=tuple(TEMPLATE_LABELS.values()),
             state="readonly",
             width=28,
         )
-        self.template_box.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+        self.template_box.pack(side="left")
         self.template_box.bind("<<ComboboxSelected>>", lambda _e: self._on_template_change())
-        ttk.Button(
-            form, text="Конструктор процессов", command=self.open_process_builder
-        ).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=3)
+        tk.Button(
+            tpl_row,
+            text="Конструктор процессов",
+            command=self.open_process_builder,
+            bg=PROCESS_BUILDER,
+            activebackground=PROCESS_BUILDER_ACTIVE,
+            relief="raised",
+            padx=10,
+            pady=4,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(8, 0))
         self.delete_template_btn = ttk.Button(
-            form, text="Удалить шаблон", command=self.delete_selected_template
+            tpl_row, text="Удалить шаблон", command=self.delete_selected_template
         )
-        self.delete_template_btn.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=3)
+        self.delete_template_btn.pack(side="left", padx=(8, 0))
 
         ttk.Label(form, text="Название:").grid(row=1, column=0, sticky="w", pady=3)
         self.process_title_var = tk.StringVar()
@@ -701,9 +711,17 @@ class ReminderApp:
             )
         self._sync_guard_fields()
 
-        ttk.Button(form, text="Создать процесс", command=self.create_process).grid(
-            row=3, column=1, sticky="e", pady=(10, 0)
-        )
+        tk.Button(
+            form,
+            text="Создать процесс",
+            command=self.create_process,
+            bg=PISTACHIO,
+            activebackground=PISTACHIO_ACTIVE,
+            relief="raised",
+            padx=10,
+            pady=4,
+            font=("Segoe UI", 9),
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
         self.refresh_template_choices()
         self._on_template_change()
 
@@ -740,10 +758,10 @@ class ReminderApp:
         self.process_tree.heading("status", text="Статус")
         self.process_tree.heading("detail", text="Подробности")
         self.process_tree.heading("notify", text="Уведомления")
-        self.process_tree.column("#0", width=360)
-        self.process_tree.column("status", width=110, anchor="center")
-        self.process_tree.column("detail", width=200)
-        self.process_tree.column("notify", width=280)
+        self.process_tree.column("#0", width=180, minwidth=120, stretch=True)
+        self.process_tree.column("status", width=100, minwidth=90, stretch=False, anchor="center")
+        self.process_tree.column("detail", width=130, minwidth=90, stretch=False)
+        self.process_tree.column("notify", width=280, minwidth=180, stretch=True)
         scroll = ttk.Scrollbar(wrapper, orient="vertical", command=self.process_tree.yview)
         self.process_tree.configure(yscrollcommand=scroll.set)
         self.process_tree.pack(side="left", fill="both", expand=True)
@@ -754,6 +772,7 @@ class ReminderApp:
         self.process_tree.tag_configure("blocked", foreground="#7a7a7a")
         self.process_tree.tag_configure("deferred", foreground="#7a7a7a")
         self.process_tree.bind("<Double-1>", self.on_process_tree_double_click)
+        self.process_tree.bind("<Button-3>", self.on_process_tree_right_click)
 
     def _on_template_change(self):
         label = self.template_var.get()
@@ -895,6 +914,18 @@ class ReminderApp:
                     )
                     if active_from and active_from > date.today():
                         detail = f"чек-лист с {active_from.strftime('%d.%m.%Y')}"
+                    if step.get("completion_type") == COMPLETION_MANUAL:
+                        mark_from = db_module.property_active_from_date(
+                            step.get("manual_active_from")
+                        )
+                        if mark_from and mark_from > date.today():
+                            detail = f"отметка с {mark_from.strftime('%d.%m.%Y')}"
+                    if step.get("completion_type") == COMPLETION_WAIT:
+                        wait_from = db_module.property_active_from_date(
+                            step.get("wait_side_from")
+                        )
+                        if wait_from and wait_from > date.today():
+                            detail = f"ожидание с {wait_from.strftime('%d.%m.%Y')}"
                     if step["status"] == STEP_WAITING and step.get("next_due"):
                         detail = f"сработает {step['next_due']}"
                     if step["status"] == STEP_OVERDUE or step.get("stale"):
@@ -922,6 +953,26 @@ class ReminderApp:
 
         if selected and self.process_tree.exists(selected[0]):
             self.process_tree.selection_set(selected[0])
+
+    def on_process_tree_right_click(self, event):
+        """Выделяет строку дерева и открывает действия шага и процесса."""
+        row = self.process_tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self.process_tree.selection_set(row)
+        menu = tk.Menu(self.process_tree, tearoff=0)
+        menu.add_command(label="Отменить шаг", command=self.complete_selected_step)
+        menu.add_command(label="Открыть чек-лист", command=self.open_selected_checklist)
+        menu.add_command(
+            label="Расписание уведомлений",
+            command=self.edit_selected_notify_schedule,
+        )
+        menu.add_command(label="Завершить", command=self.finish_selected_process)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _selected_step_id(self):
         selection = self.process_tree.selection()
@@ -1066,7 +1117,7 @@ class ReminderApp:
             items = []
             for item in row_vars:
                 kind = item["kind"].get()
-                if kind in ("at", "В время"):
+                if kind in ("at", "В время", "В это время начать напоминать"):
                     items.append(
                         {
                             "kind": "at",
@@ -1080,25 +1131,36 @@ class ReminderApp:
                     items.append({"kind": "after", "minutes": hours * 60 + minutes, "time": ""})
             return items
 
-        def redraw_rows():
+        def redraw_rows(items=None):
             for child in rows_frame.winfo_children():
                 child.destroy()
-            snapshot = collect_steps() if row_vars else list(settings.get("steps") or [])
+            if items is None:
+                snapshot = collect_steps() if row_vars else list(settings.get("steps") or [])
+            else:
+                snapshot = list(items)
             row_vars.clear()
+            settings["steps"] = snapshot
             if not snapshot:
                 ttk.Label(rows_frame, text="Шагов эскалации пока нет.", foreground="#777777").pack(
                     anchor="w"
                 )
                 return
+            total = len(snapshot)
             for index, spec in enumerate(snapshot):
-                add_row(index, spec)
+                add_row(index, spec, total)
 
-        def add_row(index, spec):
+        def add_row(index, spec, total):
             kind = spec.get("kind") or "after"
             line = ttk.Frame(rows_frame)
             line.pack(fill="x", pady=3)
             ttk.Label(line, text=f"Шаг {index + 1}").pack(side="left")
-            kind_var = tk.StringVar(value="В время" if kind in ("at", "В время") else "Через")
+            kind_var = tk.StringVar(
+                value=(
+                    "В это время начать напоминать"
+                    if kind in ("at", "В время", "В это время начать напоминать")
+                    else "Через это время напоминать"
+                )
+            )
             hours_var = tk.StringVar(value=str((int(spec.get("minutes") or 180)) // 60))
             mins_var = tk.StringVar(value=str((int(spec.get("minutes") or 0)) % 60))
             try:
@@ -1110,8 +1172,8 @@ class ReminderApp:
             ttk.Combobox(
                 line,
                 textvariable=kind_var,
-                values=("Через", "В время"),
-                width=10,
+                values=("Через это время напоминать", "В это время начать напоминать"),
+                width=28,
                 state="readonly",
             ).pack(side="left", padx=6)
             ttk.Spinbox(line, from_=0, to=168, textvariable=hours_var, width=4).pack(
@@ -1145,24 +1207,27 @@ class ReminderApp:
                 if target < 0 or target >= len(items):
                     return
                 items[current], items[target] = items[target], items[current]
-                settings["steps"] = items
-                redraw_rows()
+                redraw_rows(items)
 
             def remove(current=index):
                 items = collect_steps()
                 items.pop(current)
-                settings["steps"] = items
-                redraw_rows()
+                redraw_rows(items)
 
-            ttk.Button(line, text="↑", width=3, command=lambda: move(-1)).pack(side="left", padx=2)
-            ttk.Button(line, text="↓", width=3, command=lambda: move(1)).pack(side="left")
+            up_btn = ttk.Button(line, text="↑", width=3, command=lambda: move(-1))
+            up_btn.pack(side="left", padx=2)
+            down_btn = ttk.Button(line, text="↓", width=3, command=lambda: move(1))
+            down_btn.pack(side="left")
+            if index == 0:
+                up_btn.state(["disabled"])
+            if index >= total - 1:
+                down_btn.state(["disabled"])
             ttk.Button(line, text="Удалить", command=remove).pack(side="left", padx=4)
 
         def add_step_row():
-            items = collect_steps()
+            items = collect_steps() if row_vars else list(settings.get("steps") or [])
             items.append({"kind": "after", "minutes": 180, "time": ""})
-            settings["steps"] = items
-            redraw_rows()
+            redraw_rows(items)
 
         redraw_rows()
         ttk.Button(frame, text="Добавить шаг эскалации", command=add_step_row).grid(
@@ -1173,7 +1238,6 @@ class ReminderApp:
         until_hour_var = tk.StringVar(value=f"{until_hour:02d}")
         until_minute_var = tk.StringVar(value=f"{until_minute:02d}")
         weekends_var = tk.BooleanVar(value=bool(settings.get("notify_weekends")))
-        active_var = tk.StringVar(value=settings.get("active_from") or "")
 
         extras = ttk.Frame(frame)
         extras.grid(row=4, column=0, sticky="ew", pady=(4, 0))
@@ -1188,8 +1252,6 @@ class ReminderApp:
         ttk.Checkbutton(extras, text="Уведомлять в выходные", variable=weekends_var).pack(
             side="left", padx=(12, 0)
         )
-        ttk.Label(extras, text="Действует с:").pack(side="left", padx=(12, 4))
-        ttk.Entry(extras, textvariable=active_var, width=12).pack(side="left")
 
         def save():
             try:
@@ -1201,7 +1263,7 @@ class ReminderApp:
                     collect_steps(),
                     until_stamp,
                     weekends_var.get(),
-                    active_var.get().strip(),
+                    settings.get("active_from") or "",
                 )
             except ValueError as error:
                 messagebox.showerror("Не удалось сохранить", str(error), parent=win)
@@ -1361,6 +1423,26 @@ class ReminderApp:
             return None
         self.tree.selection_toggle(row)
         self._update_selection_label()
+        return "break"
+
+    def on_tree_right_click(self, event):
+        """Выделяет строку и открывает те же действия, что кнопки над списком."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return "break"
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)
+        self._update_selection_label()
+        menu = tk.Menu(self.tree, tearoff=0)
+        menu.add_command(label="Отложить", command=self.snooze_selected_reminder)
+        menu.add_command(label="Отметить готовым", command=self.mark_as_done)
+        menu.add_command(label="Отменить", command=self.mark_as_cancelled)
+        menu.add_command(label="Удалить", command=self.delete_reminder)
+        menu.add_command(label="Возобновить", command=self.resume_selected_reminders)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
         return "break"
 
     def mark_as_done(self):

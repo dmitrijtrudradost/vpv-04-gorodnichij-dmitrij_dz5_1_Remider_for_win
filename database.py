@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, time, date
 from templates import (
     ACTION_CHECKLIST,
     COMPLETION_CHECKLIST,
+    COMPLETION_MANUAL,
     COMPLETION_WAIT,
     ESC_FIRST,
     ESC_FREQUENT,
@@ -331,6 +332,14 @@ class ReminderDatabase:
             if step_columns and "notify_weekends" not in step_columns:
                 self._conn.execute(
                     "ALTER TABLE steps ADD COLUMN notify_weekends INTEGER NOT NULL DEFAULT 0"
+                )
+            if step_columns and "manual_active_from" not in step_columns:
+                self._conn.execute(
+                    "ALTER TABLE steps ADD COLUMN manual_active_from TEXT NOT NULL DEFAULT ''"
+                )
+            if step_columns and "wait_side_from" not in step_columns:
+                self._conn.execute(
+                    "ALTER TABLE steps ADD COLUMN wait_side_from TEXT NOT NULL DEFAULT ''"
                 )
             self._conn.execute(
                 """
@@ -747,8 +756,8 @@ class ReminderDatabase:
                                 branch_id, title, order_index, status, completion_type,
                                 action_kind, depends_on_step_id, waiting_since, escalation_index,
                                 notify_until, checklist_active_from, escalation_active_from,
-                                notify_weekends
-                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?, ?, ?)
+                                notify_weekends, manual_active_from, wait_side_from
+                            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 branch_id,
@@ -762,6 +771,8 @@ class ReminderDatabase:
                                 step_spec.get("checklist_active_from") or "",
                                 step_spec.get("escalation_active_from") or "",
                                 1 if step_spec.get("notify_weekends") else 0,
+                                step_spec.get("manual_active_from") or "",
+                                step_spec.get("wait_side_from") or "",
                             ),
                         )
                         step_id = step_cursor.lastrowid
@@ -1257,6 +1268,18 @@ class ReminderDatabase:
             raise StepDependencyError(
                 f"Нельзя закрыть шаг: сначала завершите {titles}."
             )
+        if step["completion_type"] == COMPLETION_MANUAL:
+            active_from = property_active_from_date(step.get("manual_active_from"))
+            if active_from and active_from > date.today():
+                raise StepDependencyError(
+                    f"Отметка действует с {active_from.strftime('%d.%m.%Y')}"
+                )
+        if step["completion_type"] == COMPLETION_WAIT:
+            active_from = property_active_from_date(step.get("wait_side_from"))
+            if active_from and active_from > date.today():
+                raise StepDependencyError(
+                    f"Ожидание стороны действует с {active_from.strftime('%d.%m.%Y')}"
+                )
         if step["completion_type"] == COMPLETION_CHECKLIST:
             active_from = property_active_from_date(step.get("checklist_active_from"))
             if active_from and active_from > date.today():
@@ -1343,9 +1366,16 @@ class ReminderDatabase:
                     until_minute,
                     allow_weekends=allow_weekends,
                 )
-        active_from = property_active_from_date(step.get("escalation_active_from"))
-        if active_from:
-            floor = datetime.combine(active_from, time(WORK_START_HOUR, 0))
+        floors = []
+        keys = ["escalation_active_from"]
+        if step.get("completion_type") == COMPLETION_WAIT:
+            keys.append("wait_side_from")
+        for key in keys:
+            active_from = property_active_from_date(step.get(key))
+            if active_from:
+                floors.append(datetime.combine(active_from, time(WORK_START_HOUR, 0)))
+        if floors:
+            floor = max(floors)
             if due < floor:
                 due = floor
             due = clamp_to_work_hours(

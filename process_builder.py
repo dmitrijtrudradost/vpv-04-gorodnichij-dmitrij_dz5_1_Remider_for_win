@@ -89,6 +89,16 @@ class ProcessBuilderApi:
                 pass
         return {"id": saved_id, "key": f"user:{saved_id}"}
 
+    def delete_template(self, template_id):
+        tid = int(template_id)
+        ok = self.db.delete_process_template(tid)
+        if self.on_saved:
+            try:
+                self.on_saved()
+            except Exception:
+                pass
+        return {"ok": ok, "id": tid}
+
 
 def open_process_builder(db=None, on_saved=None):
     """Запускает конструктор отдельным процессом: pywebview требует главный поток."""
